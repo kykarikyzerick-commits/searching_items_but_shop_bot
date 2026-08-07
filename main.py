@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.INFO)
 
 # ==================== НАЛАШТУВАННЯ ====================
 BOT_TOKEN = "8877190549:AAEoSIj_dOL2hi-PpDrfZFJi6h8x40hJnFQ"
-ADMIN_ID = 8138110821  # Ваш Telegram ID
+ADMIN_ID = 8138110821
 CHECK_INTERVAL = 5
 
 POPULAR_BRANDS = [
@@ -81,11 +81,16 @@ last_update_id = 0
 # ==================== КЛАВІАТУРИ ====================
 def get_main_keyboard(user_id):
     kb = []
-    if is_user_active(user_id):
-        kb.append([{"text": "🏷 Обрати бренд"}, {"text": "📏 Обрати розмір"}])
-        kb.append([{"text": "🌍 Обрати регіон"}, {"text": "📋 Мої налаштування"}])
-        kb.append([{"text": "▶️ Запустити"}, {"text": "⏹ Зупинити"}])
-    kb.append([{"text": "🔑 Активувати ключ"}, {"text": "🛒 Придбати ключ"}])
+    # Якщо немає ключа — показуємо ТІЛЬКИ кнопки активації та купівлі
+    if not is_user_active(user_id):
+        kb.append([{"text": "🔑 Активувати ключ"}, {"text": "🛒 Придбати ключ"}])
+        return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
+
+    # Повноцінне меню відкривається ЛИШЕ після активації
+    kb.append([{"text": "🏷 Обрати бренд"}, {"text": "📏 Обрати розмір"}])
+    kb.append([{"text": "🌍 Обрати регіон"}, {"text": "📋 Мої налаштування"}])
+    kb.append([{"text": "▶️ Запустити"}, {"text": "⏹ Зупинити"}])
+    kb.append([{"text": "🔑 Активувати новий ключ"}, {"text": "🛒 Придбати ключ"}])
     if user_id == ADMIN_ID:
         kb.append([{"text": "👑 Адмін-панель"}])
     return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
@@ -159,6 +164,7 @@ async def handle_update(session, update):
 
         state = user_states.get(chat_id)
 
+        # Адмін-команда створення ключа
         if state == "waiting_for_key_gen" and chat_id == ADMIN_ID:
             try:
                 days = int(text)
@@ -175,22 +181,16 @@ async def handle_update(session, update):
             user_states[chat_id] = None
             return
 
-        if state == "waiting_custom_brand":
-            user_settings.setdefault(uid_str, {})["brand"] = text
-            save_settings(user_settings)
-            await send_telegram_message(session, chat_id, f"✅ Бренд встановлено: *{text}*", get_main_keyboard(chat_id))
-            user_states[chat_id] = None
-            return
-
-        if state == "waiting_for_key":
+        # Обробка активації ключа
+        if state == "waiting_for_key" or text.startswith("VINTED-"):
             conn = sqlite3.connect("licenses.db")
             cursor = conn.cursor()
             cursor.execute("SELECT duration_days, is_used FROM keys WHERE key = ?", (text,))
             row = cursor.fetchone()
             if not row:
-                await send_telegram_message(session, chat_id, "❌ Невірний ключ.", get_main_keyboard(chat_id))
+                await send_telegram_message(session, chat_id, "❌ Невірний ключ активації.", get_main_keyboard(chat_id))
             elif row[1] == 1:
-                await send_telegram_message(session, chat_id, "❌ Цей ключ вже використано.", get_main_keyboard(chat_id))
+                await send_telegram_message(session, chat_id, "❌ Цей ключ вже був використаний.", get_main_keyboard(chat_id))
             else:
                 from datetime import datetime, timedelta
                 exp_date = datetime.now() + timedelta(days=row[0])
@@ -198,11 +198,36 @@ async def handle_update(session, update):
                 cursor.execute("UPDATE keys SET is_used = 1, used_by = ?, expires_at = ? WHERE key = ?",
                                (chat_id, exp_str, text))
                 conn.commit()
-                await send_telegram_message(session, chat_id, f"🎉 Ключ успішно активовано на {row[0]} днів!", get_main_keyboard(chat_id))
+                await send_telegram_message(session, chat_id, f"🎉 **Ключ успішно активовано на {row[0]} днів!**\nТепер вам доступний повний функціонал бота.", get_main_keyboard(chat_id))
                 user_states[chat_id] = None
             conn.close()
             return
 
+        # Перевірка на активний ключ
+        if not is_user_active(chat_id):
+            if text in ["🔑 Активувати ключ", "🔑 Активувати новий ключ"]:
+                user_states[chat_id] = "waiting_for_key"
+                await send_telegram_message(session, chat_id, "Введіть ваш ключ активації у відповідь на це повідомлення:")
+            elif text == "🛒 Придбати ключ":
+                await send_telegram_message(session, chat_id, "💳 Для купівлі ключа доступу пишіть сюди: @but_sh0ping", get_main_keyboard(chat_id))
+            else:
+                await send_telegram_message(
+                    session, 
+                    chat_id, 
+                    "🔒 **Доступ обмежено!**\n\nЩоб користуватися ботом, вам потрібно активувати ключ доступу.\nНатисніть кнопку **🔑 Активувати ключ** і введіть свій ключ або придбайте його у @but_sh0ping.", 
+                    get_main_keyboard(chat_id)
+                )
+            return
+
+        # Введення кастомного бренду
+        if state == "waiting_custom_brand":
+            user_settings.setdefault(uid_str, {})["brand"] = text
+            save_settings(user_settings)
+            await send_telegram_message(session, chat_id, f"✅ Бренд встановлено: *{text}*", get_main_keyboard(chat_id))
+            user_states[chat_id] = None
+            return
+
+        # Основні команди меню (доступні ТІЛЬКИ з ключем)
         if text in ["/start", "меню"]:
             await send_telegram_message(session, chat_id, "👋 **Ласкаво просимо!** Оберіть дію в меню:", get_main_keyboard(chat_id))
 
@@ -210,24 +235,21 @@ async def handle_update(session, update):
             user_states[chat_id] = "waiting_for_key_gen"
             await send_telegram_message(session, chat_id, "Введіть термін дії ключа у днях (наприклад: 1, 3, 7, 30):")
 
-        elif "🛒 Придбати ключ" in text:
-            await send_telegram_message(session, chat_id, "💳 Для купівлі ключа доступу або поповнення балансу пишіть сюди: @but_sh0ping", get_main_keyboard(chat_id))
-
-        elif "🔑 Активувати ключ" in text:
+        elif text in ["🔑 Активувати ключ", "🔑 Активувати новий ключ"]:
             user_states[chat_id] = "waiting_for_key"
             await send_telegram_message(session, chat_id, "Введіть ваш ключ активації:")
 
+        elif text == "🛒 Придбати ключ":
+            await send_telegram_message(session, chat_id, "💳 Для купівлі ключа доступу пишіть сюди: @but_sh0ping", get_main_keyboard(chat_id))
+
         elif "🏷 Обрати бренд" in text:
-            if not is_user_active(chat_id): return
             await send_telegram_message(session, chat_id, "Оберіть бренд або введіть свій:", get_brands_keyboard())
 
         elif "📏 Обрати розмір" in text:
-            if not is_user_active(chat_id): return
             selected = user_settings.get(uid_str, {}).get("sizes", [])
             await send_telegram_message(session, chat_id, "Оберіть розміри:", get_sizes_keyboard(selected))
 
         elif "🌍 Обрати регіон" in text:
-            if not is_user_active(chat_id): return
             curr = user_settings.get(uid_str, {}).get("domain", "pl")
             await send_telegram_message(session, chat_id, "Оберіть регіон:", get_region_keyboard(curr))
 
@@ -242,7 +264,6 @@ async def handle_update(session, update):
             await send_telegram_message(session, chat_id, info, get_main_keyboard(chat_id))
 
         elif "▶️ Запустити" in text:
-            if not is_user_active(chat_id): return
             cfg = user_settings.get(uid_str, {})
             if not cfg.get("brand"):
                 await send_telegram_message(session, chat_id, "⚠️ Спочатку оберіть бренд!", get_main_keyboard(chat_id))
@@ -262,6 +283,9 @@ async def handle_update(session, update):
         chat_id = cb["message"]["chat"]["id"]
         data = cb.get("data", "")
         uid_str = str(chat_id)
+
+        if not is_user_active(chat_id):
+            return
 
         user_settings.setdefault(uid_str, {})
 
