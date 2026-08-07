@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sqlite3
+from datetime import datetime, timedelta
 import aiohttp
 from aiohttp import web
 
@@ -12,6 +13,12 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = "8877190549:AAEoSIj_dOL2hi-PpDrfZFJi6h8x40hJnFQ"
 ADMIN_ID = 8138110821
 CHECK_INTERVAL = 5
+
+# Постійні ключі (працюють ЗАВЖДИ і не зникають при перезапуску)
+MASTER_KEYS = {
+    "VINTED-ADMIN-PASS": 365,  # Ключ на рік
+    "VINTED-TEST-KEY": 30      # Ключ на 30 днів
+}
 
 POPULAR_BRANDS = [
     "Nike", "Adidas", "Stone Island", "Carhartt", 
@@ -30,7 +37,7 @@ DOMAINS = {
     "🇬🇧 Великобританія": "co.uk"
 }
 
-# Веб-сервер для тримання порту на Render (24/7)
+# Веб-сервер для утримання порту на Render (24/7)
 async def health_check(request):
     return web.Response(text="Bot is running 24/7!")
 
@@ -58,15 +65,20 @@ def is_user_active(user_id):
     row = cursor.fetchone()
     conn.close()
     if row and row[0]:
-        from datetime import datetime
-        exp_date = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
-        return exp_date > datetime.now()
+        try:
+            exp_date = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+            return exp_date > datetime.now()
+        except Exception:
+            return False
     return False
 
 def load_settings():
     if os.path.exists("settings.json"):
-        with open("settings.json", "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open("settings.json", "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
     return {}
 
 def save_settings(settings):
@@ -81,12 +93,10 @@ last_update_id = 0
 # ==================== КЛАВІАТУРИ ====================
 def get_main_keyboard(user_id):
     kb = []
-    # Якщо немає ключа — показуємо ТІЛЬКИ кнопки активації та купівлі
     if not is_user_active(user_id):
         kb.append([{"text": "🔑 Активувати ключ"}, {"text": "🛒 Придбати ключ"}])
         return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
 
-    # Повноцінне меню відкривається ЛИШЕ після активації
     kb.append([{"text": "🏷 Обрати бренд"}, {"text": "📏 Обрати розмір"}])
     kb.append([{"text": "🌍 Обрати регіон"}, {"text": "📋 Мої налаштування"}])
     kb.append([{"text": "▶️ Запустити"}, {"text": "⏹ Зупинити"}])
@@ -164,7 +174,7 @@ async def handle_update(session, update):
 
         state = user_states.get(chat_id)
 
-        # Адмін-команда створення ключа
+        # Генерація ключа для Адміна
         if state == "waiting_for_key_gen" and chat_id == ADMIN_ID:
             try:
                 days = int(text)
@@ -181,45 +191,58 @@ async def handle_update(session, update):
             user_states[chat_id] = None
             return
 
-        # Обробка активації ключа
+        # Активація ключа користувачем
         if state == "waiting_for_key" or text.startswith("VINTED-"):
-            conn = sqlite3.connect("licenses.db")
-            cursor = conn.cursor()
-            cursor.execute("SELECT duration_days, is_used FROM keys WHERE key = ?", (text,))
-            row = cursor.fetchone()
-            if not row:
-                await send_telegram_message(session, chat_id, "❌ Невірний ключ активації.", get_main_keyboard(chat_id))
-            elif row[1] == 1:
-                await send_telegram_message(session, chat_id, "❌ Цей ключ вже був використаний.", get_main_keyboard(chat_id))
+            days_to_add = None
+
+            # Перевірка майстер-ключів
+            if text in MASTER_KEYS:
+                days_to_add = MASTER_KEYS[text]
             else:
-                from datetime import datetime, timedelta
-                exp_date = datetime.now() + timedelta(days=row[0])
+                conn = sqlite3.connect("licenses.db")
+                cursor = conn.cursor()
+                cursor.execute("SELECT duration_days, is_used FROM keys WHERE key = ?", (text,))
+                row = cursor.fetchone()
+                if row and row[1] == 0:
+                    days_to_add = row[0]
+                    cursor.execute("UPDATE keys SET is_used = 1 WHERE key = ?", (text,))
+                    conn.commit()
+                conn.close()
+
+            if days_to_add:
+                exp_date = datetime.now() + timedelta(days=days_to_add)
                 exp_str = exp_date.strftime("%Y-%m-%d %H:%M:%S")
-                cursor.execute("UPDATE keys SET is_used = 1, used_by = ?, expires_at = ? WHERE key = ?",
-                               (chat_id, exp_str, text))
+
+                conn = sqlite3.connect("licenses.db")
+                cursor = conn.cursor()
+                cursor.execute("INSERT OR REPLACE INTO keys (key, duration_days, is_used, used_by, expires_at) VALUES (?, ?, 1, ?, ?)",
+                               (text, days_to_add, chat_id, exp_str))
                 conn.commit()
-                await send_telegram_message(session, chat_id, f"🎉 **Ключ успішно активовано на {row[0]} днів!**\nТепер вам доступний повний функціонал бота.", get_main_keyboard(chat_id))
+                conn.close()
+
+                await send_telegram_message(session, chat_id, f"🎉 **Ключ успішно активовано на {days_to_add} днів!**\n\nТепер вам відкрити повне меню бота.", get_main_keyboard(chat_id))
                 user_states[chat_id] = None
-            conn.close()
+            else:
+                await send_telegram_message(session, chat_id, "❌ **Невірний або вже використаний ключ.**", get_main_keyboard(chat_id))
             return
 
-        # Перевірка на активний ключ
+        # Якщо не активний
         if not is_user_active(chat_id):
             if text in ["🔑 Активувати ключ", "🔑 Активувати новий ключ"]:
                 user_states[chat_id] = "waiting_for_key"
-                await send_telegram_message(session, chat_id, "Введіть ваш ключ активації у відповідь на це повідомлення:")
+                await send_telegram_message(session, chat_id, "Введіть ваш ключ у відповідь на це повідомлення:")
             elif text == "🛒 Придбати ключ":
                 await send_telegram_message(session, chat_id, "💳 Для купівлі ключа доступу пишіть сюди: @but_sh0ping", get_main_keyboard(chat_id))
             else:
                 await send_telegram_message(
                     session, 
                     chat_id, 
-                    "🔒 **Доступ обмежено!**\n\nЩоб користуватися ботом, вам потрібно активувати ключ доступу.\nНатисніть кнопку **🔑 Активувати ключ** і введіть свій ключ або придбайте його у @but_sh0ping.", 
+                    "🔒 **Доступ обмежено!**\n\nДля роботи з ботом необхідно активувати ключ.\nНатисніть **🔑 Активувати ключ** або напишіть @but_sh0ping для купівлі.", 
                     get_main_keyboard(chat_id)
                 )
             return
 
-        # Введення кастомного бренду
+        # Меню авторизованого користувача
         if state == "waiting_custom_brand":
             user_settings.setdefault(uid_str, {})["brand"] = text
             save_settings(user_settings)
@@ -227,7 +250,6 @@ async def handle_update(session, update):
             user_states[chat_id] = None
             return
 
-        # Основні команди меню (доступні ТІЛЬКИ з ключем)
         if text in ["/start", "меню"]:
             await send_telegram_message(session, chat_id, "👋 **Ласкаво просимо!** Оберіть дію в меню:", get_main_keyboard(chat_id))
 
