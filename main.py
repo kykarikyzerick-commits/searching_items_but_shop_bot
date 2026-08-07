@@ -14,10 +14,16 @@ BOT_TOKEN = "8877190549:AAEoSIj_dOL2hi-PpDrfZFJi6h8x40hJnFQ"
 ADMIN_ID = 8138110821
 CHECK_INTERVAL = 5
 
-# Постійні ключі (працюють ЗАВЖДИ і не зникають при перезапуску)
+# Список Telegram ID користувачів з постійним доступом
+ALLOWED_USERS = [
+    8138110821,  # Ваш ID (Адмін)
+]
+
+# Постійні ключі (працюють ЗАВЖДИ навіть після перезапуску Render)
 MASTER_KEYS = {
-    "VINTED-ADMIN-PASS": 365,  # Ключ на рік
-    "VINTED-TEST-KEY": 30      # Ключ на 30 днів
+    "VINTED-VIP-2026": 365,   # Ключ на 1 рік
+    "VINTED-FREE-TEST": 30,   # Ключ на 30 днів
+    "VINTED-KEY-7DAYS": 7     # Ключ на 7 днів
 }
 
 POPULAR_BRANDS = [
@@ -37,7 +43,7 @@ DOMAINS = {
     "🇬🇧 Великобританія": "co.uk"
 }
 
-# Веб-сервер для утримання порту на Render (24/7)
+# Сервер для підтримання роботи на Render (24/7)
 async def health_check(request):
     return web.Response(text="Bot is running 24/7!")
 
@@ -57,8 +63,9 @@ def init_db():
     conn.close()
 
 def is_user_active(user_id):
-    if user_id == ADMIN_ID:
+    if user_id in ALLOWED_USERS or user_id == ADMIN_ID:
         return True
+
     conn = sqlite3.connect("licenses.db")
     cursor = conn.cursor()
     cursor.execute("SELECT expires_at FROM keys WHERE used_by = ? AND is_used = 1", (user_id,))
@@ -172,9 +179,21 @@ async def handle_update(session, update):
         text = msg.get("text", "").strip()
         uid_str = str(chat_id)
 
+        logging.info(f"Отримано повідомлення від {chat_id}: {text}")
+
+        # Першочергова обробка старт/меню для всіх
+        if text in ["/start", "меню", "Start", "start"]:
+            await send_telegram_message(
+                session, 
+                chat_id, 
+                "👋 **Ласкаво просимо!** Оберіть дію в меню нижче:", 
+                get_main_keyboard(chat_id)
+            )
+            return
+
         state = user_states.get(chat_id)
 
-        # Генерація ключа для Адміна
+        # Генерація ключа (Адмін)
         if state == "waiting_for_key_gen" and chat_id == ADMIN_ID:
             try:
                 days = int(text)
@@ -185,17 +204,16 @@ async def handle_update(session, update):
                 cursor.execute("INSERT INTO keys (key, duration_days) VALUES (?, ?)", (new_key, days))
                 conn.commit()
                 conn.close()
-                await send_telegram_message(session, chat_id, f"🔑 **Згенеровано ключ:** `{new_key}` на {days} днів.", get_main_keyboard(chat_id))
+                await send_telegram_message(session, chat_id, f"🔑 **Згенеровано тимчасовий ключ:** `{new_key}` на {days} днів.", get_main_keyboard(chat_id))
             except ValueError:
                 await send_telegram_message(session, chat_id, "❌ Введіть число днів цифрою.")
             user_states[chat_id] = None
             return
 
-        # Активація ключа користувачем
+        # Активація ключа
         if state == "waiting_for_key" or text.startswith("VINTED-"):
             days_to_add = None
 
-            # Перевірка майстер-ключів
             if text in MASTER_KEYS:
                 days_to_add = MASTER_KEYS[text]
             else:
@@ -220,17 +238,17 @@ async def handle_update(session, update):
                 conn.commit()
                 conn.close()
 
-                await send_telegram_message(session, chat_id, f"🎉 **Ключ успішно активовано на {days_to_add} днів!**\n\nТепер вам відкрити повне меню бота.", get_main_keyboard(chat_id))
+                await send_telegram_message(session, chat_id, f"🎉 **Ключ успішно активовано на {days_to_add} днів!**\n\nВам відкрито повне меню бота.", get_main_keyboard(chat_id))
                 user_states[chat_id] = None
             else:
                 await send_telegram_message(session, chat_id, "❌ **Невірний або вже використаний ключ.**", get_main_keyboard(chat_id))
             return
 
-        # Якщо не активний
+        # Перевірка наявності підписки
         if not is_user_active(chat_id):
             if text in ["🔑 Активувати ключ", "🔑 Активувати новий ключ"]:
                 user_states[chat_id] = "waiting_for_key"
-                await send_telegram_message(session, chat_id, "Введіть ваш ключ у відповідь на це повідомлення:")
+                await send_telegram_message(session, chat_id, "Надішліть ваш ключ у відповідь на це повідомлення:")
             elif text == "🛒 Придбати ключ":
                 await send_telegram_message(session, chat_id, "💳 Для купівлі ключа доступу пишіть сюди: @but_sh0ping", get_main_keyboard(chat_id))
             else:
@@ -250,16 +268,13 @@ async def handle_update(session, update):
             user_states[chat_id] = None
             return
 
-        if text in ["/start", "меню"]:
-            await send_telegram_message(session, chat_id, "👋 **Ласкаво просимо!** Оберіть дію в меню:", get_main_keyboard(chat_id))
-
         elif "👑 Адмін-панель" in text and chat_id == ADMIN_ID:
             user_states[chat_id] = "waiting_for_key_gen"
             await send_telegram_message(session, chat_id, "Введіть термін дії ключа у днях (наприклад: 1, 3, 7, 30):")
 
         elif text in ["🔑 Активувати ключ", "🔑 Активувати новий ключ"]:
             user_states[chat_id] = "waiting_for_key"
-            await send_telegram_message(session, chat_id, "Введіть ваш ключ активації:")
+            await send_telegram_message(session, chat_id, "Надішліть ваш ключ активації:")
 
         elif text == "🛒 Придбати ключ":
             await send_telegram_message(session, chat_id, "💳 Для купівлі ключа доступу пишіть сюди: @but_sh0ping", get_main_keyboard(chat_id))
