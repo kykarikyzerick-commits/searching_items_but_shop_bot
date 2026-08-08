@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 # ==================== НАЛАШТУВАННЯ ====================
 BOT_TOKEN = "8877190549:AAEoSIj_dOL2hi-PpDrfZFJi6h8x40hJnFQ"
 ADMIN_ID = 8138110821
-CHECK_INTERVAL = 2
+CHECK_INTERVAL = 3
 
 ALLOWED_USERS = [8138110821]
 
@@ -93,6 +93,7 @@ user_settings = load_settings()
 user_states = {}
 seen_items = set()
 last_update_id = 0
+vinted_cookies = {}
 
 # ==================== КЛАВІАТУРИ ====================
 def get_main_keyboard(user_id):
@@ -203,7 +204,6 @@ async def handle_update(session, update):
 
         state = user_states.get(chat_id)
 
-        # Введення власного бренду
         if state == "waiting_custom_brand":
             user_settings.setdefault(uid_str, {})["brand"] = text
             save_settings(user_settings)
@@ -211,7 +211,6 @@ async def handle_update(session, update):
             user_states[chat_id] = None
             return
 
-        # Введення власної ціни
         if state == "waiting_custom_price":
             user_settings.setdefault(uid_str, {})["price"] = text
             save_settings(user_settings)
@@ -219,7 +218,6 @@ async def handle_update(session, update):
             user_states[chat_id] = None
             return
 
-        # Генерація ключа (Адмін)
         if state == "waiting_for_key_gen" and chat_id == ADMIN_ID:
             try:
                 days = int(text)
@@ -236,7 +234,6 @@ async def handle_update(session, update):
             user_states[chat_id] = None
             return
 
-        # Активація ключа
         if state == "waiting_for_key" or text.startswith("VINTED-"):
             days_to_add = None
             if text in MASTER_KEYS:
@@ -279,7 +276,6 @@ async def handle_update(session, update):
                 await send_telegram_message(session, chat_id, "🔒 **Доступ обмежено!** Натисніть **🔑 Активувати ключ** або пишіть @but_sh0ping.", get_main_keyboard(chat_id))
             return
 
-        # Меню команд
         if "👑 Адмін-панель" in text and chat_id == ADMIN_ID:
             user_states[chat_id] = "waiting_for_key_gen"
             await send_telegram_message(session, chat_id, "Введіть термін дії ключа у днях:")
@@ -324,7 +320,7 @@ async def handle_update(session, update):
                 return
             user_settings.setdefault(uid_str, {})["active"] = True
             save_settings(user_settings)
-            await send_telegram_message(session, chat_id, "🚀 **Пошук успішно запущено!**", get_main_keyboard(chat_id))
+            await send_telegram_message(session, chat_id, "🚀 **Пошук успішно запущено!** Чекайте на перші знахідки.", get_main_keyboard(chat_id))
 
         elif "⏹ Зупинити" in text:
             if uid_str in user_settings:
@@ -355,7 +351,7 @@ async def handle_update(session, update):
 
         elif data == "custom_price":
             user_states[chat_id] = "waiting_custom_price"
-            await send_telegram_message(session, chat_id, "Напишіть максимальну ціну у відповідь (наприклад: `20` або `15-50`):")
+            await send_telegram_message(session, chat_id, "Напишіть максимальну ціну у відповідь (наприклад: `20`):")
 
         elif data.startswith("toggle_size:"):
             size = data.split(":")[1]
@@ -382,14 +378,26 @@ async def handle_update(session, update):
             save_settings(user_settings)
             await send_telegram_message(session, chat_id, f"✅ Регіон: *{code.upper()}*", get_main_keyboard(chat_id))
 
-# ==================== ОПТИМІЗОВАНИЙ ПАРСИНГ VINTED ====================
-async def fetch_vinted(session):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9"
-    }
+# ==================== ОНОЛЕНИЙ ПАРСИНГ З ПООДИНКИМИ КУКАМИ ====================
+async def get_vinted_cookie(session, domain):
+    if domain in vinted_cookies:
+        return vinted_cookies[domain]
 
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+    }
+    url = f"https://www.vinted.{domain}"
+    try:
+        async with session.get(url, headers=headers, timeout=5) as resp:
+            cookies = resp.cookies
+            cookie_str = "; ".join([f"{k}={v.value}" for k, v in cookies.items()])
+            vinted_cookies[domain] = cookie_str
+            return cookie_str
+    except Exception as e:
+        logging.error(f"Помилка отримання куків для {domain}: {e}")
+        return ""
+
+async def fetch_vinted(session):
     for uid_str, config in list(user_settings.items()):
         if not config.get("active") or not config.get("brand"):
             continue
@@ -403,23 +411,28 @@ async def fetch_vinted(session):
         user_sizes = config.get("sizes", [])
         user_price_str = config.get("price", "Будь-яка ціна")
 
-        # Отримання куків для авторизації сесії
-        base_url = f"https://www.vinted.{domain}"
-        try:
-            async with session.get(base_url, headers=headers, timeout=3) as init_resp:
-                pass
-        except Exception:
-            pass
+        cookie = await get_vinted_cookie(session, domain)
 
-        api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={brand}&order=newest_first"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Cookie": cookie
+        }
+
+        api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={brand}&order=newest_first&per_page=15"
 
         try:
-            async with session.get(api_url, headers=headers, timeout=5) as resp:
+            async with session.get(api_url, headers=headers, timeout=6) as resp:
+                if resp.status == 401 or resp.status == 403:
+                    # Якщо токен застарів — очищаємо та беремо новий
+                    vinted_cookies.pop(domain, None)
+                    continue
+
                 if resp.status == 200:
                     data = await resp.json()
                     items = data.get("items", [])
 
-                    for item in items[:10]:
+                    for item in items:
                         if item.get("promoted") or item.get("is_promoted"):
                             continue
 
@@ -427,11 +440,10 @@ async def fetch_vinted(session):
                         if item_id in seen_items:
                             continue
 
-                        # Перевірка ціни
-                        raw_price = item.get("price")
+                        # Фільтрація ціни
                         try:
-                            item_price = float(raw_price) if raw_price else 0.0
-                        except ValueError:
+                            item_price = float(item.get("price", 0))
+                        except (ValueError, TypeError):
                             item_price = 0.0
 
                         if "Будь-яка" not in user_price_str:
@@ -441,7 +453,7 @@ async def fetch_vinted(session):
                                 if item_price > max_p:
                                     continue
 
-                        # Перевірка розміру
+                        # Фільтрація розмірів
                         size_title = str(item.get("size_title", "")).upper()
                         if user_sizes:
                             if not any(s.upper() in size_title for s in user_sizes):
