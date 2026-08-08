@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO)
 # ==================== НАЛАШТУВАННЯ ====================
 BOT_TOKEN = "8877190549:AAEoSIj_dOL2hi-PpDrfZFJi6h8x40hJnFQ"
 ADMIN_ID = 8138110821
-CHECK_INTERVAL = 2  # Прискорено перевірку
+CHECK_INTERVAL = 1.5
 
 ALLOWED_USERS = [8138110821]
 
@@ -30,18 +30,15 @@ POPULAR_BRANDS = [
 SIZES = ["XS", "S", "M", "L", "XL", "XXL"]
 
 DOMAINS = {
-    "🇵🇱 Польща": "pl",
-    "🇨🇿 Чехія": "cz",
-    "🇱🇹 Литва": "lt",
-    "🇷🇴 Румунія": "ro",
-    "🇩🇪 Німеччина": "de",
-    "🇫🇷 Франція": "fr",
-    "🇬🇧 Великобританія": "co.uk"
+    "🇵🇱 Польща": {"code": "pl", "currency": "PLN", "prices": ["До 50 PLN", "До 100 PLN", "До 200 PLN", "Будь-яка ціна"]},
+    "🇦🇹 Австрія": {"code": "at", "currency": "EUR", "prices": ["До 10 €", "До 25 €", "До 50 €", "Будь-яка ціна"]},
+    "🇨🇿 Чехія": {"code": "cz", "currency": "CZK", "prices": ["До 250 CZK", "До 500 CZK", "До 1000 CZK", "Будь-яка ціна"]},
+    "🇱🇹 Литва": {"code": "lt", "currency": "EUR", "prices": ["До 10 €", "До 25 €", "До 50 €", "Будь-яка ціна"]},
+    "🇷🇴 Румунія": {"code": "ro", "currency": "RON", "prices": ["До 50 RON", "До 100 RON", "До 200 RON", "Будь-яка ціна"]},
+    "🇩🇪 Німеччина": {"code": "de", "currency": "EUR", "prices": ["До 10 €", "До 25 €", "До 50 €", "Будь-яка ціна"]},
+    "🇫🇷 Франція": {"code": "fr", "currency": "EUR", "prices": ["До 10 €", "До 25 €", "До 50 €", "Будь-яка ціна"]},
+    "🇬🇧 Великобританія": {"code": "co.uk", "currency": "GBP", "prices": ["До 10 £", "До 25 £", "До 50 £", "Будь-яка ціна"]}
 }
-
-PRICE_RANGES = [
-    "До 500 UAH", "До 1000 UAH", "До 2000 UAH", "Будь-яка ціна"
-]
 
 async def health_check(request):
     return web.Response(text="Bot is running 24/7!")
@@ -138,15 +135,22 @@ def get_sizes_keyboard(selected_sizes):
     buttons.append([{"text": "👌 Готово", "callback_data": "close_size_menu"}])
     return {"inline_keyboard": buttons}
 
-def get_price_keyboard():
+def get_price_keyboard(domain_code):
+    price_list = ["До 10 €", "До 25 €", "До 50 €", "Будь-яка ціна"]
+    for reg_data in DOMAINS.values():
+        if reg_data["code"] == domain_code:
+            price_list = reg_data["prices"]
+            break
+
     buttons = []
-    for p in PRICE_RANGES:
+    for p in price_list:
         buttons.append([{"text": p, "callback_data": f"set_price:{p}"}])
     return {"inline_keyboard": buttons}
 
 def get_region_keyboard(current_domain):
     buttons = []
-    for name, code in DOMAINS.items():
+    for name, data in DOMAINS.items():
+        code = data["code"]
         prefix = "✅ " if code == current_domain else ""
         buttons.append([{"text": f"{prefix}{name}", "callback_data": f"set_reg:{code}"}])
     return {"inline_keyboard": buttons}
@@ -185,6 +189,7 @@ async def handle_update(session, update):
         uid_str = str(chat_id)
 
         if text in ["/start", "меню", "Start", "start"]:
+            user_states[chat_id] = None
             await send_telegram_message(
                 session, 
                 chat_id, 
@@ -195,6 +200,7 @@ async def handle_update(session, update):
 
         state = user_states.get(chat_id)
 
+        # Генерація ключа (Адмін)
         if state == "waiting_for_key_gen" and chat_id == ADMIN_ID:
             try:
                 days = int(text)
@@ -211,6 +217,7 @@ async def handle_update(session, update):
             user_states[chat_id] = None
             return
 
+        # Активація ключа
         if state == "waiting_for_key" or text.startswith("VINTED-"):
             days_to_add = None
             if text in MASTER_KEYS:
@@ -237,22 +244,24 @@ async def handle_update(session, update):
                 conn.commit()
                 conn.close()
 
-                await send_telegram_message(session, chat_id, f"🎉 **Ключ активовано на {days_to_add} днів!**", get_main_keyboard(chat_id))
                 user_states[chat_id] = None
+                await send_telegram_message(session, chat_id, f"🎉 **Ключ успішно активовано на {days_to_add} днів!**\n\nВам відкрито доступ до всіх функцій.", get_main_keyboard(chat_id))
             else:
-                await send_telegram_message(session, chat_id, "❌ **Невірний або використаний ключ.**", get_main_keyboard(chat_id))
+                await send_telegram_message(session, chat_id, "❌ **Невірний або вже використаний ключ.**", get_main_keyboard(chat_id))
             return
 
+        # Перевірка наявності підписки
         if not is_user_active(chat_id):
             if text in ["🔑 Активувати ключ", "🔑 Активувати новий ключ"]:
                 user_states[chat_id] = "waiting_for_key"
-                await send_telegram_message(session, chat_id, "Надішліть ваш ключ активації:")
+                await send_telegram_message(session, chat_id, "Надішліть ваш ключ активації у відповідь:")
             elif text == "🛒 Придбати ключ":
                 await send_telegram_message(session, chat_id, "💳 Купівля ключа: @but_sh0ping", get_main_keyboard(chat_id))
             else:
                 await send_telegram_message(session, chat_id, "🔒 **Доступ обмежено!** Натисніть **🔑 Активувати ключ** або пишіть @but_sh0ping.", get_main_keyboard(chat_id))
             return
 
+        # Меню авторизованого користувача
         if state == "waiting_custom_brand":
             user_settings.setdefault(uid_str, {})["brand"] = text
             save_settings(user_settings)
@@ -272,17 +281,18 @@ async def handle_update(session, update):
             await send_telegram_message(session, chat_id, "💳 Купівля ключа: @but_sh0ping", get_main_keyboard(chat_id))
 
         elif "🏷 Обрати бренд" in text:
-            await send_telegram_message(session, chat_id, "Оберіть бренд у меню нижче або введіть свій:", get_brands_keyboard())
+            await send_telegram_message(session, chat_id, "Оберіть бренд з меню нижче або введіть свій:", get_brands_keyboard())
 
         elif "📏 Обрати розмір" in text:
             selected = user_settings.get(uid_str, {}).get("sizes", [])
-            await send_telegram_message(session, chat_id, "Оберіть розміри в меню нижче:", get_sizes_keyboard(selected))
+            await send_telegram_message(session, chat_id, "Оберіть розміри:", get_sizes_keyboard(selected))
 
         elif "💵 Макс. Ціна" in text:
-            await send_telegram_message(session, chat_id, "Оберіть максимальну ціну:", get_price_keyboard())
+            domain_code = user_settings.get(uid_str, {}).get("domain", "at")
+            await send_telegram_message(session, chat_id, "Оберіть максимальну ціну:", get_price_keyboard(domain_code))
 
         elif "🌍 Обрати регіон" in text:
-            curr = user_settings.get(uid_str, {}).get("domain", "pl")
+            curr = user_settings.get(uid_str, {}).get("domain", "at")
             await send_telegram_message(session, chat_id, "Оберіть регіон з меню:", get_region_keyboard(curr))
 
         elif "📋 Мої налаштування" in text:
@@ -290,7 +300,7 @@ async def handle_update(session, update):
             brand = cfg.get("brand", "Не обрано")
             sizes = ", ".join(cfg.get("sizes", [])) or "Всі"
             price = cfg.get("price", "Будь-яка ціна")
-            domain = cfg.get("domain", "pl").upper()
+            domain = cfg.get("domain", "at").upper()
             status = "🟢 Активний" if cfg.get("active") else "🔴 Зупинений"
             
             info = f"⚙️ **Налаштування:**\n\n🏷 **Бренд:** {brand}\n📏 **Розміри:** {sizes}\n💵 **Макс. ціна:** {price}\n🌍 **Регіон:** {domain}\n📡 **Статус:** {status}"
@@ -303,7 +313,7 @@ async def handle_update(session, update):
                 return
             user_settings.setdefault(uid_str, {})["active"] = True
             save_settings(user_settings)
-            await send_telegram_message(session, chat_id, "🚀 **Швидкісний пошук запущено!**", get_main_keyboard(chat_id))
+            await send_telegram_message(session, chat_id, "🚀 **Пошук успішно запущено!**", get_main_keyboard(chat_id))
 
         elif "⏹ Зупинити" in text:
             if uid_str in user_settings:
@@ -357,6 +367,7 @@ async def handle_update(session, update):
             save_settings(user_settings)
             await send_telegram_message(session, chat_id, f"✅ Регіон: *{code.upper()}*", get_main_keyboard(chat_id))
 
+# ==================== ФОНОВІ ЗАДАЧІ ====================
 async def handle_telegram_commands(session):
     global last_update_id
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
@@ -367,22 +378,10 @@ async def handle_telegram_commands(session):
             if data.get("ok") and data.get("result"):
                 for update in data["result"]:
                     last_update_id = update["update_id"]
-                    await handle_update(session, update)
+                    asyncio.create_task(handle_update(session, update))
     except Exception as e:
         logging.error(f"Помилка API: {e}")
 
-async def clear_old_updates(session):
-    global last_update_id
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-    try:
-        async with session.get(url, params={"offset": -1}) as resp:
-            data = await resp.json()
-            if data.get("ok") and data.get("result"):
-                last_update_id = data["result"][-1]["update_id"]
-    except Exception as e:
-        logging.error(f"Очищення: {e}")
-
-# ==================== ОПТИМІЗОВАНИЙ ПАРСИНГ ====================
 async def fetch_vinted(session):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
@@ -397,14 +396,14 @@ async def fetch_vinted(session):
         if not is_user_active(user_id):
             continue
 
-        domain = config.get("domain", "pl")
+        domain = config.get("domain", "at")
         brand = config.get("brand")
         user_sizes = config.get("sizes", [])
 
         api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={brand}&order=newest_first"
 
         try:
-            async with session.get(api_url, headers=headers, timeout=5) as resp:
+            async with session.get(api_url, headers=headers, timeout=4) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     items = data.get("items", [])
@@ -468,7 +467,6 @@ async def main():
     await site.start()
 
     async with aiohttp.ClientSession() as session:
-        await clear_old_updates(session)
         while True:
             await handle_telegram_commands(session)
             await fetch_vinted(session)
