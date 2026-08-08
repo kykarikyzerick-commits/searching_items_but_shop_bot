@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 # ==================== НАЛАШТУВАННЯ ====================
 BOT_TOKEN = "8877190549:AAEoSIj_dOL2hi-PpDrfZFJi6h8x40hJnFQ"
 ADMIN_ID = 8138110821
-CHECK_INTERVAL = 3
+CHECK_INTERVAL = 2
 
 ALLOWED_USERS = [8138110821]
 
@@ -29,6 +29,18 @@ POPULAR_BRANDS = [
 ]
 
 SIZES = ["XS", "S", "M", "L", "XL", "XXL"]
+
+# Багатомовний словник для блокування фейків і копій
+FAKE_KEYWORDS = [
+    # Англійська
+    "fake", "replica", "rep", "1:1", "1v1", "copy", "counterfeit", "knockoff", "bootleg", "not original", "ua pair", "high quality rep",
+    # Французька
+    "faux", "fausse", "réplique", "replique", "copie", "contrefaçon", "contrefacon", "pas vrai", "imitation",
+    # Німецька / Польська / Чеська / Іспанська
+    "gefälscht", "gefaelscht", "kopia", "fałszywy", "replika", "falso", "copia",
+    # Українська / Російська
+    "1в1", "репліка", "реплика", "копія", "копия", "фейк", "паль", "люкс"
+]
 
 DOMAINS = {
     "🇵🇱 Польща": {"code": "pl", "currency": "PLN", "prices": ["До 50 PLN", "До 100 PLN", "До 200 PLN"]},
@@ -320,7 +332,7 @@ async def handle_update(session, update):
                 return
             user_settings.setdefault(uid_str, {})["active"] = True
             save_settings(user_settings)
-            await send_telegram_message(session, chat_id, "🚀 **Пошук успішно запущено!** Чекайте на перші знахідки.", get_main_keyboard(chat_id))
+            await send_telegram_message(session, chat_id, "🚀 **Моніторинг найновіших оригіналів запущено!**", get_main_keyboard(chat_id))
 
         elif "⏹ Зупинити" in text:
             if uid_str in user_settings:
@@ -378,7 +390,7 @@ async def handle_update(session, update):
             save_settings(user_settings)
             await send_telegram_message(session, chat_id, f"✅ Регіон: *{code.upper()}*", get_main_keyboard(chat_id))
 
-# ==================== ОНОЛЕНИЙ ПАРСИНГ З ПООДИНКИМИ КУКАМИ ====================
+# ==================== ПАРСИНГ З СУВОРОЮ ПЕРЕВІРКОЮ БРЕНДУ ТА МУЛЬТИМОВНИМ АНТИФЕЙКОМ ====================
 async def get_vinted_cookie(session, domain):
     if domain in vinted_cookies:
         return vinted_cookies[domain]
@@ -393,8 +405,7 @@ async def get_vinted_cookie(session, domain):
             cookie_str = "; ".join([f"{k}={v.value}" for k, v in cookies.items()])
             vinted_cookies[domain] = cookie_str
             return cookie_str
-    except Exception as e:
-        logging.error(f"Помилка отримання куків для {domain}: {e}")
+    except Exception:
         return ""
 
 async def fetch_vinted(session):
@@ -407,7 +418,7 @@ async def fetch_vinted(session):
             continue
 
         domain = config.get("domain", "at")
-        brand = config.get("brand")
+        target_brand = str(config.get("brand", "")).strip().lower()
         user_sizes = config.get("sizes", [])
         user_price_str = config.get("price", "Будь-яка ціна")
 
@@ -419,12 +430,11 @@ async def fetch_vinted(session):
             "Cookie": cookie
         }
 
-        api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={brand}&order=newest_first&per_page=15"
+        api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={target_brand}&order=newest_first&per_page=20"
 
         try:
             async with session.get(api_url, headers=headers, timeout=6) as resp:
-                if resp.status == 401 or resp.status == 403:
-                    # Якщо токен застарів — очищаємо та беремо новий
+                if resp.status in (401, 403):
                     vinted_cookies.pop(domain, None)
                     continue
 
@@ -440,7 +450,20 @@ async def fetch_vinted(session):
                         if item_id in seen_items:
                             continue
 
-                        # Фільтрація ціни
+                        # 1. Сувора перевірка бренду
+                        item_brand_raw = str(item.get("brand_title", "")).strip().lower()
+                        if target_brand not in item_brand_raw:
+                            continue
+
+                        # 2. Перевірка на фейки та копії (багатомовна)
+                        title = str(item.get("title", ""))
+                        description = str(item.get("description", ""))
+                        full_text = f"{title} {description}".lower()
+
+                        if any(fake_word in full_text for fake_word in FAKE_KEYWORDS):
+                            continue
+
+                        # 3. Перевірка цінового ліміту
                         try:
                             item_price = float(item.get("price", 0))
                         except (ValueError, TypeError):
@@ -453,7 +476,7 @@ async def fetch_vinted(session):
                                 if item_price > max_p:
                                     continue
 
-                        # Фільтрація розмірів
+                        # 4. Перевірка розміру
                         size_title = str(item.get("size_title", "")).upper()
                         if user_sizes:
                             if not any(s.upper() in size_title for s in user_sizes):
@@ -461,9 +484,7 @@ async def fetch_vinted(session):
 
                         seen_items.add(item_id)
 
-                        title = item.get("title", "Без назви")
-                        item_brand = item.get("brand_title", brand)
-                        currency = item.get("currency", "EUR")
+                        item_brand_display = item.get("brand_title", config.get("brand"))
                         item_url = item.get("url", f"https://www.vinted.{domain}")
 
                         photo_data = item.get("photo", {})
@@ -474,11 +495,11 @@ async def fetch_vinted(session):
                         seller_status = "⚠️ Новий акаунт / Без відгуків" if seller_feedback == 0 else f"✅ Відгуків: {seller_feedback}"
                         seller_url = user_data.get("profile_url", item_url)
 
+                        # Опис картки без рядка з ціною
                         caption = (
                             f"⚡️ **НОВА ЗНАХІДКА VINTED** ⚡️\n\n"
                             f"🏷 **Назва:** {title}\n"
-                            f"📌 **Бренд:** {item_brand}\n"
-                            f"💰 **Ціна:** {item_price} {currency}\n"
+                            f"📌 **Бренд:** {item_brand_display}\n"
                             f"📏 **Розмір:** {size_title or 'Не вказано'}\n"
                             f"🛡 **Продавець:** {seller_status}"
                         )
