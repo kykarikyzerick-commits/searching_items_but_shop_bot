@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta
 import aiohttp
@@ -12,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 # ==================== НАЛАШТУВАННЯ ====================
 BOT_TOKEN = "8877190549:AAEoSIj_dOL2hi-PpDrfZFJi6h8x40hJnFQ"
 ADMIN_ID = 8138110821
-CHECK_INTERVAL = 1.5
+CHECK_INTERVAL = 2
 
 ALLOWED_USERS = [8138110821]
 
@@ -30,14 +31,14 @@ POPULAR_BRANDS = [
 SIZES = ["XS", "S", "M", "L", "XL", "XXL"]
 
 DOMAINS = {
-    "🇵🇱 Польща": {"code": "pl", "currency": "PLN", "prices": ["До 50 PLN", "До 100 PLN", "До 200 PLN", "Будь-яка ціна"]},
-    "🇦🇹 Австрія": {"code": "at", "currency": "EUR", "prices": ["До 10 €", "До 25 €", "До 50 €", "Будь-яка ціна"]},
-    "🇨🇿 Чехія": {"code": "cz", "currency": "CZK", "prices": ["До 250 CZK", "До 500 CZK", "До 1000 CZK", "Будь-яка ціна"]},
-    "🇱🇹 Литва": {"code": "lt", "currency": "EUR", "prices": ["До 10 €", "До 25 €", "До 50 €", "Будь-яка ціна"]},
-    "🇷🇴 Румунія": {"code": "ro", "currency": "RON", "prices": ["До 50 RON", "До 100 RON", "До 200 RON", "Будь-яка ціна"]},
-    "🇩🇪 Німеччина": {"code": "de", "currency": "EUR", "prices": ["До 10 €", "До 25 €", "До 50 €", "Будь-яка ціна"]},
-    "🇫🇷 Франція": {"code": "fr", "currency": "EUR", "prices": ["До 10 €", "До 25 €", "До 50 €", "Будь-яка ціна"]},
-    "🇬🇧 Великобританія": {"code": "co.uk", "currency": "GBP", "prices": ["До 10 £", "До 25 £", "До 50 £", "Будь-яка ціна"]}
+    "🇵🇱 Польща": {"code": "pl", "currency": "PLN", "prices": ["До 50 PLN", "До 100 PLN", "До 200 PLN"]},
+    "🇦🇹 Австрія": {"code": "at", "currency": "EUR", "prices": ["До 10 €", "До 25 €", "До 50 €"]},
+    "🇨🇿 Чехія": {"code": "cz", "currency": "CZK", "prices": ["До 250 CZK", "До 500 CZK", "До 1000 CZK"]},
+    "🇱🇹 Литва": {"code": "lt", "currency": "EUR", "prices": ["До 10 €", "До 25 €", "До 50 €"]},
+    "🇷🇴 Румунія": {"code": "ro", "currency": "RON", "prices": ["До 50 RON", "До 100 RON", "До 200 RON"]},
+    "🇩🇪 Німеччина": {"code": "de", "currency": "EUR", "prices": ["До 10 €", "До 25 €", "До 50 €"]},
+    "🇫🇷 Франція": {"code": "fr", "currency": "EUR", "prices": ["До 10 €", "До 25 €", "До 50 €"]},
+    "🇬🇧 Великобританія": {"code": "co.uk", "currency": "GBP", "prices": ["До 10 £", "До 25 £", "До 50 £"]}
 }
 
 async def health_check(request):
@@ -136,7 +137,7 @@ def get_sizes_keyboard(selected_sizes):
     return {"inline_keyboard": buttons}
 
 def get_price_keyboard(domain_code):
-    price_list = ["До 10 €", "До 25 €", "До 50 €", "Будь-яка ціна"]
+    price_list = ["До 10 €", "До 25 €", "До 50 €"]
     for reg_data in DOMAINS.values():
         if reg_data["code"] == domain_code:
             price_list = reg_data["prices"]
@@ -145,6 +146,8 @@ def get_price_keyboard(domain_code):
     buttons = []
     for p in price_list:
         buttons.append([{"text": p, "callback_data": f"set_price:{p}"}])
+    buttons.append([{"text": "✏️ Ввести свою ціну", "callback_data": "custom_price"}])
+    buttons.append([{"text": "🌐 Будь-яка ціна", "callback_data": "set_price:Будь-яка ціна"}])
     return {"inline_keyboard": buttons}
 
 def get_region_keyboard(current_domain):
@@ -200,6 +203,22 @@ async def handle_update(session, update):
 
         state = user_states.get(chat_id)
 
+        # Введення власного бренду
+        if state == "waiting_custom_brand":
+            user_settings.setdefault(uid_str, {})["brand"] = text
+            save_settings(user_settings)
+            await send_telegram_message(session, chat_id, f"✅ Бренд встановлено: *{text}*", get_main_keyboard(chat_id))
+            user_states[chat_id] = None
+            return
+
+        # Введення власної ціни
+        if state == "waiting_custom_price":
+            user_settings.setdefault(uid_str, {})["price"] = text
+            save_settings(user_settings)
+            await send_telegram_message(session, chat_id, f"✅ Максимальну ціну встановлено: *{text}*", get_main_keyboard(chat_id))
+            user_states[chat_id] = None
+            return
+
         # Генерація ключа (Адмін)
         if state == "waiting_for_key_gen" and chat_id == ADMIN_ID:
             try:
@@ -245,12 +264,11 @@ async def handle_update(session, update):
                 conn.close()
 
                 user_states[chat_id] = None
-                await send_telegram_message(session, chat_id, f"🎉 **Ключ успішно активовано на {days_to_add} днів!**\n\nВам відкрито доступ до всіх функцій.", get_main_keyboard(chat_id))
+                await send_telegram_message(session, chat_id, f"🎉 **Ключ успішно активовано на {days_to_add} днів!**", get_main_keyboard(chat_id))
             else:
                 await send_telegram_message(session, chat_id, "❌ **Невірний або вже використаний ключ.**", get_main_keyboard(chat_id))
             return
 
-        # Перевірка наявності підписки
         if not is_user_active(chat_id):
             if text in ["🔑 Активувати ключ", "🔑 Активувати новий ключ"]:
                 user_states[chat_id] = "waiting_for_key"
@@ -261,15 +279,8 @@ async def handle_update(session, update):
                 await send_telegram_message(session, chat_id, "🔒 **Доступ обмежено!** Натисніть **🔑 Активувати ключ** або пишіть @but_sh0ping.", get_main_keyboard(chat_id))
             return
 
-        # Меню авторизованого користувача
-        if state == "waiting_custom_brand":
-            user_settings.setdefault(uid_str, {})["brand"] = text
-            save_settings(user_settings)
-            await send_telegram_message(session, chat_id, f"✅ Бренд встановлено: *{text}*", get_main_keyboard(chat_id))
-            user_states[chat_id] = None
-            return
-
-        elif "👑 Адмін-панель" in text and chat_id == ADMIN_ID:
+        # Меню команд
+        if "👑 Адмін-панель" in text and chat_id == ADMIN_ID:
             user_states[chat_id] = "waiting_for_key_gen"
             await send_telegram_message(session, chat_id, "Введіть термін дії ключа у днях:")
 
@@ -289,7 +300,7 @@ async def handle_update(session, update):
 
         elif "💵 Макс. Ціна" in text:
             domain_code = user_settings.get(uid_str, {}).get("domain", "at")
-            await send_telegram_message(session, chat_id, "Оберіть максимальну ціну:", get_price_keyboard(domain_code))
+            await send_telegram_message(session, chat_id, "Оберіть або введіть максимальну ціну:", get_price_keyboard(domain_code))
 
         elif "🌍 Обрати регіон" in text:
             curr = user_settings.get(uid_str, {}).get("domain", "at")
@@ -342,6 +353,10 @@ async def handle_update(session, update):
             user_states[chat_id] = "waiting_custom_brand"
             await send_telegram_message(session, chat_id, "Напишіть назву бренду у відповідь:")
 
+        elif data == "custom_price":
+            user_states[chat_id] = "waiting_custom_price"
+            await send_telegram_message(session, chat_id, "Напишіть максимальну ціну у відповідь (наприклад: `20` або `15-50`):")
+
         elif data.startswith("toggle_size:"):
             size = data.split(":")[1]
             sizes = user_settings[uid_str].get("sizes", [])
@@ -367,25 +382,12 @@ async def handle_update(session, update):
             save_settings(user_settings)
             await send_telegram_message(session, chat_id, f"✅ Регіон: *{code.upper()}*", get_main_keyboard(chat_id))
 
-# ==================== ФОНОВІ ЗАДАЧІ ====================
-async def handle_telegram_commands(session):
-    global last_update_id
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-    params = {"offset": last_update_id + 1, "timeout": 1}
-    try:
-        async with session.get(url, params=params) as resp:
-            data = await resp.json()
-            if data.get("ok") and data.get("result"):
-                for update in data["result"]:
-                    last_update_id = update["update_id"]
-                    asyncio.create_task(handle_update(session, update))
-    except Exception as e:
-        logging.error(f"Помилка API: {e}")
-
+# ==================== ОПТИМІЗОВАНИЙ ПАРСИНГ VINTED ====================
 async def fetch_vinted(session):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Accept": "application/json"
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9"
     }
 
     for uid_str, config in list(user_settings.items()):
@@ -399,11 +401,20 @@ async def fetch_vinted(session):
         domain = config.get("domain", "at")
         brand = config.get("brand")
         user_sizes = config.get("sizes", [])
+        user_price_str = config.get("price", "Будь-яка ціна")
+
+        # Отримання куків для авторизації сесії
+        base_url = f"https://www.vinted.{domain}"
+        try:
+            async with session.get(base_url, headers=headers, timeout=3) as init_resp:
+                pass
+        except Exception:
+            pass
 
         api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={brand}&order=newest_first"
 
         try:
-            async with session.get(api_url, headers=headers, timeout=4) as resp:
+            async with session.get(api_url, headers=headers, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     items = data.get("items", [])
@@ -416,6 +427,21 @@ async def fetch_vinted(session):
                         if item_id in seen_items:
                             continue
 
+                        # Перевірка ціни
+                        raw_price = item.get("price")
+                        try:
+                            item_price = float(raw_price) if raw_price else 0.0
+                        except ValueError:
+                            item_price = 0.0
+
+                        if "Будь-яка" not in user_price_str:
+                            digits = re.findall(r"\d+", user_price_str)
+                            if digits:
+                                max_p = float(digits[-1])
+                                if item_price > max_p:
+                                    continue
+
+                        # Перевірка розміру
                         size_title = str(item.get("size_title", "")).upper()
                         if user_sizes:
                             if not any(s.upper() in size_title for s in user_sizes):
@@ -425,7 +451,6 @@ async def fetch_vinted(session):
 
                         title = item.get("title", "Без назви")
                         item_brand = item.get("brand_title", brand)
-                        price = item.get("price", "N/A")
                         currency = item.get("currency", "EUR")
                         item_url = item.get("url", f"https://www.vinted.{domain}")
 
@@ -441,7 +466,7 @@ async def fetch_vinted(session):
                             f"⚡️ **НОВА ЗНАХІДКА VINTED** ⚡️\n\n"
                             f"🏷 **Назва:** {title}\n"
                             f"📌 **Бренд:** {item_brand}\n"
-                            f"💰 **Ціна:** {price} {currency}\n"
+                            f"💰 **Ціна:** {item_price} {currency}\n"
                             f"📏 **Розмір:** {size_title or 'Не вказано'}\n"
                             f"🛡 **Продавець:** {seller_status}"
                         )
@@ -453,7 +478,22 @@ async def fetch_vinted(session):
                         else:
                             asyncio.create_task(send_telegram_message(session, user_id, caption, keyboard))
         except Exception as e:
-            logging.error(f"Помилка парсингу: {e}")
+            logging.error(f"Помилка парсингу Vinted: {e}")
+
+# ==================== ОСНОВНИЙ ЦИКЛ ====================
+async def handle_telegram_commands(session):
+    global last_update_id
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    params = {"offset": last_update_id + 1, "timeout": 1}
+    try:
+        async with session.get(url, params=params) as resp:
+            data = await resp.json()
+            if data.get("ok") and data.get("result"):
+                for update in data["result"]:
+                    last_update_id = update["update_id"]
+                    asyncio.create_task(handle_update(session, update))
+    except Exception as e:
+        logging.error(f"Помилка Telegram API: {e}")
 
 async def main():
     init_db()
