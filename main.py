@@ -13,7 +13,9 @@ logging.basicConfig(level=logging.INFO)
 # ==================== НАЛАШТУВАННЯ ====================
 BOT_TOKEN = "8877190549:AAEoSIj_dOL2hi-PpDrfZFJi6h8x40hJnFQ"
 ADMIN_ID = 8138110821
-CHECK_INTERVAL = 3
+
+# Збільшено інтервал до 12 секунд для захисту від блокування IP на Render
+CHECK_INTERVAL = 12
 
 ALLOWED_USERS = [8138110821]
 
@@ -28,7 +30,6 @@ POPULAR_BRANDS = [
     "Jordan", "Stussy", "Trapstar", "The North Face"
 ]
 
-# Оновлений список розмірів (одяг + взуття)
 SIZES = [
     "XS", "S", "M", "L", "XL", "XXL",
     "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46"
@@ -354,7 +355,6 @@ async def handle_update(session, update):
             brand = data.split(":")[1]
             user_settings[uid_str]["brand"] = brand
             save_settings(user_settings)
-            # Прибрано авто-виклики меню розмірів
             await send_telegram_message(session, chat_id, f"✅ Обрано бренд: *{brand}*", get_main_keyboard(chat_id))
 
         elif data == "custom_brand":
@@ -392,24 +392,26 @@ async def handle_update(session, update):
             save_settings(user_settings)
             await send_telegram_message(session, chat_id, f"✅ Регіон: *{code.upper()}*", get_main_keyboard(chat_id))
 
-# ==================== ПАРСИНГ VINTED ====================
+# ==================== ОНОВЛЕНИЙ ПАРСИНГ VINTED ====================
 async def get_vinted_cookie(session, domain):
     if domain in vinted_cookies and vinted_cookies[domain]:
         return vinted_cookies[domain]
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     }
     url = f"https://www.vinted.{domain}"
     try:
-        async with session.get(url, headers=headers, timeout=8) as resp:
+        async with session.get(url, headers=headers, timeout=10) as resp:
             cookies = resp.cookies
             cookie_str = "; ".join([f"{k}={v.value}" for k, v in cookies.items()])
             if cookie_str:
                 vinted_cookies[domain] = cookie_str
             return cookie_str
     except Exception as e:
-        logging.error(f"Помилка авторизації куків для domain {domain}: {e}")
+        logging.error(f"Помилка завантаження Cookie для domain {domain}: {e}")
         return ""
 
 async def fetch_vinted(session):
@@ -429,15 +431,17 @@ async def fetch_vinted(session):
         cookie = await get_vinted_cookie(session, domain)
 
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"https://www.vinted.{domain}/catalog",
             "Cookie": cookie
         }
 
         api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={target_brand}&order=newest_first&per_page=20"
 
         try:
-            async with session.get(api_url, headers=headers, timeout=8) as resp:
+            async with session.get(api_url, headers=headers, timeout=10) as resp:
                 if resp.status in (401, 403, 429):
                     vinted_cookies.pop(domain, None)
                     continue
@@ -459,7 +463,7 @@ async def fetch_vinted(session):
                         item_brand = str(item.get("brand_title", ""))
                         full_text = f"{title} {description} {item_brand}".lower()
 
-                        # 1. Гнучка перевірка бренду
+                        # 1. Пошукова відповідність
                         if target_brand.lower() not in full_text:
                             continue
 
@@ -480,7 +484,7 @@ async def fetch_vinted(session):
                                 if item_price > max_p:
                                     continue
 
-                        # 4. Фільтр розмірів (підтримує одяг та взуття)
+                        # 4. Фільтр розмірів
                         size_title = str(item.get("size_title", "")).upper()
                         if user_sizes:
                             if not any(s.upper() in size_title for s in user_sizes):
