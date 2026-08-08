@@ -28,7 +28,11 @@ POPULAR_BRANDS = [
     "Jordan", "Stussy", "Trapstar", "The North Face"
 ]
 
-SIZES = ["XS", "S", "M", "L", "XL", "XXL"]
+# Оновлений список розмірів (одяг + взуття)
+SIZES = [
+    "XS", "S", "M", "L", "XL", "XXL",
+    "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46"
+]
 
 FAKE_KEYWORDS = [
     "fake", "replica", "rep", "1:1", "1v1", "copy", "counterfeit", "knockoff", "bootleg", "not original", "ua pair", "high quality rep",
@@ -299,7 +303,7 @@ async def handle_update(session, update):
 
         elif "📏 Обрати розмір" in text:
             selected = user_settings.get(uid_str, {}).get("sizes", [])
-            await send_telegram_message(session, chat_id, "Оберіть розміри:", get_sizes_keyboard(selected))
+            await send_telegram_message(session, chat_id, "Оберіть розміри одягу або взуття:", get_sizes_keyboard(selected))
 
         elif "💵 Макс. Ціна" in text:
             domain_code = user_settings.get(uid_str, {}).get("domain", "at")
@@ -350,6 +354,7 @@ async def handle_update(session, update):
             brand = data.split(":")[1]
             user_settings[uid_str]["brand"] = brand
             save_settings(user_settings)
+            # Прибрано авто-виклики меню розмірів
             await send_telegram_message(session, chat_id, f"✅ Обрано бренд: *{brand}*", get_main_keyboard(chat_id))
 
         elif data == "custom_brand":
@@ -363,8 +368,10 @@ async def handle_update(session, update):
         elif data.startswith("toggle_size:"):
             size = data.split(":")[1]
             sizes = user_settings[uid_str].get("sizes", [])
-            if size in sizes: sizes.remove(size)
-            else: sizes.append(size)
+            if size in sizes: 
+                sizes.remove(size)
+            else: 
+                sizes.append(size)
             user_settings[uid_str]["sizes"] = sizes
             save_settings(user_settings)
             await send_telegram_message(session, chat_id, "Оновлено", get_sizes_keyboard(sizes))
@@ -385,7 +392,7 @@ async def handle_update(session, update):
             save_settings(user_settings)
             await send_telegram_message(session, chat_id, f"✅ Регіон: *{code.upper()}*", get_main_keyboard(chat_id))
 
-# ==================== ОНОВЛЕНИЙ ПАРСИНГ ====================
+# ==================== ПАРСИНГ VINTED ====================
 async def get_vinted_cookie(session, domain):
     if domain in vinted_cookies and vinted_cookies[domain]:
         return vinted_cookies[domain]
@@ -452,11 +459,11 @@ async def fetch_vinted(session):
                         item_brand = str(item.get("brand_title", ""))
                         full_text = f"{title} {description} {item_brand}".lower()
 
-                        # 1. Гнучка перевірка відповідності бренду
+                        # 1. Гнучка перевірка бренду
                         if target_brand.lower() not in full_text:
                             continue
 
-                        # 2. Перевірка на фейки та копії
+                        # 2. Перевірка на фейки
                         if any(fake_word in full_text for fake_word in FAKE_KEYWORDS):
                             continue
 
@@ -473,7 +480,7 @@ async def fetch_vinted(session):
                                 if item_price > max_p:
                                     continue
 
-                        # 4. Фільтр розмірів
+                        # 4. Фільтр розмірів (підтримує одяг та взуття)
                         size_title = str(item.get("size_title", "")).upper()
                         if user_sizes:
                             if not any(s.upper() in size_title for s in user_sizes):
