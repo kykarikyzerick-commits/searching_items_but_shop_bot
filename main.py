@@ -4,7 +4,6 @@ import logging
 import os
 import random
 import re
-import sqlite3
 import string
 from datetime import datetime, timedelta
 import aiohttp
@@ -16,7 +15,6 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = "8877190549:AAEoSIj_dOL2hi-PpDrfZFJi6h8x40hJnFQ"
 ADMIN_ID = 8138110821
 
-# Зменшено для прискорення
 CHECK_INTERVAL = 2
 
 ALLOWED_USERS = [8138110821]
@@ -50,98 +48,88 @@ DOMAINS = {
     "🇬🇧 Великобританія": {"code": "co.uk", "currency": "GBP"}
 }
 
-DB_PATH = "licenses.db"
+# ==================== ЗБЕРЕЖЕННЯ ДАНИХ (JSON) ====================
+KEYS_FILE = "keys.json"
+SETTINGS_FILE = "settings.json"
+
+def load_data(filename):
+    if os.path.exists(filename):
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_data(filename, data):
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+
+db_keys = load_data(KEYS_FILE)
+user_settings = load_data(SETTINGS_FILE)
+user_states = {}
+seen_items = set()
+last_update_id = 0
+vinted_cookies = {}
 
 async def health_check(request):
     return web.Response(text="Bot is running 24/7!")
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS keys (
-            key TEXT PRIMARY KEY,
-            duration_days INTEGER,
-            is_used INTEGER DEFAULT 0,
-            used_by INTEGER,
-            expires_at DATETIME
-        )
-    """)
-    conn.commit()
-    conn.close()
 
 def generate_random_key(days):
     rand_str = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
     key_code = f"VINTED-{days}D-{rand_str}"
     
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO keys (key, duration_days, is_used) VALUES (?, ?, 0)", (key_code, days))
-    conn.commit()
-    conn.close()
+    db_keys[key_code] = {
+        "duration_days": days,
+        "is_used": False,
+        "used_by": None,
+        "expires_at": None
+    }
+    save_data(KEYS_FILE, db_keys)
     return key_code
 
 def is_user_active(user_id):
     if user_id in ALLOWED_USERS or user_id == ADMIN_ID:
         return True
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT expires_at FROM keys WHERE used_by = ? AND is_used = 1", (user_id,))
-    rows = cursor.fetchall()
-    conn.close()
-    
-    for row in rows:
-        if row and row[0]:
-            try:
-                exp_date = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
-                if exp_date > datetime.now():
-                    return True
-            except Exception:
-                continue
+    now = datetime.now()
+    for key, data in db_keys.items():
+        if data.get("used_by") == user_id and data.get("is_used"):
+            exp_str = data.get("expires_at")
+            if exp_str:
+                try:
+                    exp_date = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S")
+                    if exp_date > now:
+                        return True
+                except Exception:
+                    continue
     return False
 
 def get_key_remaining_time(user_id):
     if user_id in ALLOWED_USERS or user_id == ADMIN_ID:
         return "Безлімітний доступ (Адмін/VIP)"
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT expires_at FROM keys WHERE used_by = ? AND is_used = 1 ORDER BY expires_at DESC", (user_id,))
-    row = cursor.fetchone()
-    conn.close()
+    now = datetime.now()
+    latest_exp = None
+    for key, data in db_keys.items():
+        if data.get("used_by") == user_id and data.get("is_used"):
+            exp_str = data.get("expires_at")
+            if exp_str:
+                try:
+                    exp_date = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S")
+                    if exp_date > now:
+                        if not latest_exp or exp_date > latest_exp:
+                            latest_exp = exp_date
+                except Exception:
+                    pass
 
-    if row and row[0]:
-        try:
-            exp_date = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
-            now = datetime.now()
-            if exp_date > now:
-                diff = exp_date - now
-                days = diff.days
-                hours = diff.seconds // 3600
-                return f"{days} днів, {hours} годин"
-        except Exception:
-            pass
+    if latest_exp:
+        diff = latest_exp - now
+        days = diff.days
+        hours = diff.seconds // 3600
+        return f"{days} днів, {hours} годин"
+
     return None
-
-def load_settings():
-    if os.path.exists("settings.json"):
-        try:
-            with open("settings.json", "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-def save_settings(settings):
-    with open("settings.json", "w", encoding="utf-8") as f:
-        json.dump(settings, f, ensure_ascii=False, indent=4)
-
-user_settings = load_settings()
-user_states = {}
-seen_items = set()
-last_update_id = 0
-vinted_cookies = {}
 
 # ==================== КЛАВІАТУРИ НИЖНЬОЇ ПАНЕЛІ ====================
 def get_main_keyboard(user_id):
@@ -227,7 +215,6 @@ async def send_telegram_photo(session, chat_id, photo_url, caption, reply_markup
 
 # ==================== ВАЛІДАЦІЯ БРЕНДІВ ====================
 async def is_valid_brand(session, brand_name, domain="at"):
-    # Перевірка формату та символів
     if len(brand_name) < 2 or len(brand_name) > 30:
         return False, "❌ Назва бренду повинна бути від 2 до 30 символів."
     
@@ -237,7 +224,6 @@ async def is_valid_brand(session, brand_name, domain="at"):
     if not re.match(r"^[a-zA-Z0-9\s\-\&\.\'\+]+$", brand_name):
         return False, "❌ Введіть коректну назву бренду (букви, цифри, пробіли, дефіси)."
 
-    # Перевірка реального існування бренду через API Vinted
     cookie = await get_vinted_cookie(session, domain)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -301,32 +287,21 @@ async def handle_update(session, update):
                 return
 
             if text == "📊 Статистика":
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute("SELECT COUNT(*) FROM keys")
-                total_keys = cursor.fetchone()[0]
-                cursor.execute("SELECT COUNT(*) FROM keys WHERE is_used = 1")
-                used_keys = cursor.fetchone()[0]
-                conn.close()
+                total_keys = len(db_keys)
+                used_keys = sum(1 for k in db_keys.values() if k.get("is_used"))
 
-                stat_msg = f"📊 **Статистика бота:**\n\n🔑 Всього ключів: *{total_keys}*\n✅ Активовано ключів: *{used_keys}*\n👥 Активних користувачів у файлі: *{len(user_settings)}*"
+                stat_msg = f"📊 **Статистика бота:**\n\n🔑 Всього ключів: *{total_keys}*\n✅ Активовано ключів: *{used_keys}*\n👥 Активних користувачів: *{len(user_settings)}*"
                 await send_telegram_message(session, chat_id, stat_msg, get_admin_keyboard())
                 return
 
             if text == "📋 Список ключів":
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute("SELECT key, duration_days, is_used, expires_at FROM keys ORDER BY is_used ASC LIMIT 20")
-                rows = cursor.fetchall()
-                conn.close()
-
-                if not rows:
+                if not db_keys:
                     await send_telegram_message(session, chat_id, "📋 Список ключів порожній.", get_admin_keyboard())
                 else:
                     msg_list = "📋 **Останні ключі:**\n\n"
-                    for r in rows:
-                        st = "❌ Використаний" if r[2] == 1 else "🟢 Вільний"
-                        msg_list += f"`{r[0]}` | {r[1]} дн. | {st}\n"
+                    for k, val in list(db_keys.items())[-20:]:
+                        st = "❌ Використаний" if val.get("is_used") else "🟢 Вільний"
+                        msg_list += f"`{k}` | {val.get('duration_days')} дн. | {st}\n"
                     await send_telegram_message(session, chat_id, msg_list, get_admin_keyboard())
                 return
 
@@ -335,7 +310,7 @@ async def handle_update(session, update):
         if clean_reg_text in DOMAINS:
             code = DOMAINS[clean_reg_text]["code"]
             user_settings.setdefault(uid_str, {})["domain"] = code
-            save_settings(user_settings)
+            save_data(SETTINGS_FILE, user_settings)
             await send_telegram_message(session, chat_id, f"✅ Регіон змінено на: *{clean_reg_text}*", get_region_panel_keyboard(chat_id))
             return
 
@@ -348,21 +323,19 @@ async def handle_update(session, update):
             else:
                 sizes.append(clean_size)
             user_settings[uid_str]["sizes"] = sizes
-            save_settings(user_settings)
+            save_data(SETTINGS_FILE, user_settings)
             await send_telegram_message(session, chat_id, "📏 Оновлено розміри на панелі:", get_sizes_panel_keyboard(chat_id))
             return
 
-        # Додавання бренду з додатковими перевірками
+        # Додавання бренду
         if state == "waiting_add_brand":
             user_states[chat_id] = None
             brands = user_settings.setdefault(uid_str, {}).get("brands", [])
 
-            # Перевірка на дублікати (без урахування регістру)
             if any(b.lower() == text.lower() for b in brands):
                 await send_telegram_message(session, chat_id, "⚠️ Цей бренд вже є у вашому списку!", get_main_keyboard(chat_id))
                 return
 
-            # Валідація назви бренду
             domain = user_settings.get(uid_str, {}).get("domain", "at")
             is_valid, err_msg = await is_valid_brand(session, text, domain)
             if not is_valid:
@@ -371,13 +344,13 @@ async def handle_update(session, update):
 
             brands.append(text)
             user_settings[uid_str]["brands"] = brands
-            save_settings(user_settings)
+            save_data(SETTINGS_FILE, user_settings)
             await send_telegram_message(session, chat_id, f"✅ Бренд *{text}* успішно додано!", get_main_keyboard(chat_id))
             return
 
         if state == "waiting_custom_price":
             user_settings.setdefault(uid_str, {})["price"] = text
-            save_settings(user_settings)
+            save_data(SETTINGS_FILE, user_settings)
             await send_telegram_message(session, chat_id, f"✅ Максимальну ціну встановлено: *{text}*", get_main_keyboard(chat_id))
             user_states[chat_id] = None
             return
@@ -386,27 +359,20 @@ async def handle_update(session, update):
             days_to_add = None
             if text in MASTER_KEYS:
                 days_to_add = MASTER_KEYS[text]
-            else:
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute("SELECT duration_days, is_used FROM keys WHERE key = ?", (text,))
-                row = cursor.fetchone()
-                if row and row[1] == 0:
-                    days_to_add = row[0]
-                    cursor.execute("UPDATE keys SET is_used = 1, used_by = ? WHERE key = ?", (chat_id, text))
-                    conn.commit()
-                conn.close()
+            elif text in db_keys and not db_keys[text].get("is_used"):
+                days_to_add = db_keys[text].get("duration_days")
 
             if days_to_add:
                 exp_date = datetime.now() + timedelta(days=days_to_add)
                 exp_str = exp_date.strftime("%Y-%m-%d %H:%M:%S")
 
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute("INSERT OR REPLACE INTO keys (key, duration_days, is_used, used_by, expires_at) VALUES (?, ?, 1, ?, ?)",
-                               (text, days_to_add, chat_id, exp_str))
-                conn.commit()
-                conn.close()
+                db_keys[text] = {
+                    "duration_days": days_to_add,
+                    "is_used": True,
+                    "used_by": chat_id,
+                    "expires_at": exp_str
+                }
+                save_data(KEYS_FILE, db_keys)
 
                 user_states[chat_id] = None
                 await send_telegram_message(session, chat_id, f"🎉 **Ключ успішно активовано на {days_to_add} днів!**", get_main_keyboard(chat_id))
@@ -440,7 +406,7 @@ async def handle_update(session, update):
 
         elif text == "🗑 Очистити бренди":
             user_settings.setdefault(uid_str, {})["brands"] = []
-            save_settings(user_settings)
+            save_data(SETTINGS_FILE, user_settings)
             await send_telegram_message(session, chat_id, "🗑 Список брендів очищено.", get_main_keyboard(chat_id))
 
         elif text == "📏 Налаштувати розміри":
@@ -448,7 +414,7 @@ async def handle_update(session, update):
 
         elif text == "🧹 Очистити розміри":
             user_settings.setdefault(uid_str, {})["sizes"] = []
-            save_settings(user_settings)
+            save_data(SETTINGS_FILE, user_settings)
             await send_telegram_message(session, chat_id, "🧹 Розміри скинуто.", get_sizes_panel_keyboard(chat_id))
 
         elif text == "🌍 Обрати регіон":
@@ -475,13 +441,13 @@ async def handle_update(session, update):
                 await send_telegram_message(session, chat_id, "⚠️ Спочатку додайте хоча б один бренд!", get_main_keyboard(chat_id))
                 return
             user_settings.setdefault(uid_str, {})["active"] = True
-            save_settings(user_settings)
+            save_data(SETTINGS_FILE, user_settings)
             await send_telegram_message(session, chat_id, "Пошук запущено", get_main_keyboard(chat_id))
 
         elif text == "⏹ Зупинити":
             if uid_str in user_settings:
                 user_settings[uid_str]["active"] = False
-                save_settings(user_settings)
+                save_data(SETTINGS_FILE, user_settings)
             await send_telegram_message(session, chat_id, "⏹ Пошук зупинено.", get_main_keyboard(chat_id))
 
 # ==================== ОПТИМІЗОВАНИЙ ПАРСИНГ VINTED ====================
@@ -618,7 +584,6 @@ async def fetch_vinted(session):
             "Cookie": cookie
         }
 
-        # Асинхронний паралельний запуск перевірки для кожного бренду
         for target_brand in target_brands:
             tasks.append(
                 process_brand_search(
@@ -645,8 +610,6 @@ async def handle_telegram_commands(session):
         logging.error(f"Помилка Telegram API: {e}")
 
 async def main():
-    init_db()
-
     app = web.Application()
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
