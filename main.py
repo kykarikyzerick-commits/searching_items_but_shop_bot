@@ -16,7 +16,8 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = "8877190549:AAEoSIj_dOL2hi-PpDrfZFJi6h8x40hJnFQ"
 ADMIN_ID = 8138110821
 
-MONGO_URI = "mongodb+srv://illya:2010@cluster0.p71v9.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+# Новий оновлений URI для MongoDB з вашим актуальним паролем і кластером
+MONGO_URI = "mongodb+srv://kykarikyzerick_db_user:CVz4czwK06sgQlSP@cluster0.xuoxdku.mongodb.net/?appName=Cluster0"
 
 CHECK_INTERVAL = 1.0
 ALLOWED_USERS = [8138110821]
