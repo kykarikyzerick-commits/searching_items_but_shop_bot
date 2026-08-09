@@ -4,6 +4,7 @@ import os
 import random
 import re
 import string
+import json
 from datetime import datetime, timedelta
 import aiohttp
 from aiohttp import web
@@ -15,11 +16,9 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = "8877190549:AAEoSIj_dOL2hi-PpDrfZFJi6h8x40hJnFQ"
 ADMIN_ID = 8138110821
 
-# Рядок підключення до вашої MongoDB Atlas
 MONGO_URI = "mongodb+srv://illya:2010@cluster0.p71v9.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 
-CHECK_INTERVAL = 2
-
+CHECK_INTERVAL = 0.5
 ALLOWED_USERS = [8138110821]
 
 MASTER_KEYS = {
@@ -62,7 +61,7 @@ seen_items = set()
 last_update_id = 0
 vinted_cookies = {}
 
-# ==================== РОБОТА З БД (MONGODB) ====================
+# ==================== РОБОТА З БД ====================
 async def get_user_settings(user_id):
     uid_str = str(user_id)
     doc = await settings_collection.find_one({"user_id": uid_str})
@@ -228,16 +227,22 @@ async def send_telegram_message(session, chat_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
-    async with session.post(url, json=payload) as resp:
-        return await resp.json()
+    try:
+        async with session.post(url, json=payload, timeout=5) as resp:
+            return await resp.json()
+    except Exception as e:
+        logging.error(f"Telegram Send Error: {e}")
 
 async def send_telegram_photo(session, chat_id, photo_url, caption, reply_markup=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     payload = {"chat_id": chat_id, "photo": photo_url, "caption": caption, "parse_mode": "Markdown"}
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
-    async with session.post(url, json=payload) as resp:
-        return await resp.json()
+    try:
+        async with session.post(url, json=payload, timeout=5) as resp:
+            return await resp.json()
+    except Exception as e:
+        logging.error(f"Telegram Photo Error: {e}")
 
 # ==================== ВАЛІДАЦІЯ БРЕНДІВ ====================
 async def is_valid_brand(session, brand_name, domain="at"):
@@ -258,7 +263,7 @@ async def is_valid_brand(session, brand_name, domain="at"):
     }
     api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={brand_name}&per_page=5"
     try:
-        async with session.get(api_url, headers=headers, timeout=5) as resp:
+        async with session.get(api_url, headers=headers, timeout=4) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 items = data.get("items", [])
@@ -497,7 +502,7 @@ async def get_vinted_cookie(session, domain):
     }
     url = f"https://www.vinted.{domain}"
     try:
-        async with session.get(url, headers=headers, timeout=10) as resp:
+        async with session.get(url, headers=headers, timeout=5) as resp:
             cookies = resp.cookies
             cookie_str = "; ".join([f"{k}={v.value}" for k, v in cookies.items()])
             if cookie_str:
@@ -509,7 +514,7 @@ async def get_vinted_cookie(session, domain):
 async def process_brand_search(session, user_id, target_brand, domain, user_sizes, user_price_str, currency_symbol, headers):
     api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={target_brand}&order=newest_first&per_page=15"
     try:
-        async with session.get(api_url, headers=headers, timeout=8) as resp:
+        async with session.get(api_url, headers=headers, timeout=5) as resp:
             if resp.status in (401, 403, 429):
                 vinted_cookies.pop(domain, None)
                 return
@@ -585,8 +590,8 @@ async def process_brand_search(session, user_id, target_brand, domain, user_size
                         asyncio.create_task(send_telegram_photo(session, user_id, photo_url, caption, keyboard))
                     else:
                         asyncio.create_task(send_telegram_message(session, user_id, caption, keyboard))
-    except Exception as e:
-        logging.error(f"Помилка МП парсингу: {e}")
+    except Exception:
+        pass
 
 async def fetch_vinted(session):
     tasks = []
@@ -628,22 +633,22 @@ async def fetch_vinted(session):
             )
 
     if tasks:
-        await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 # ==================== ОСНОВНИЙ ЦИКЛ ====================
 async def handle_telegram_commands(session):
     global last_update_id
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-    params = {"offset": last_update_id + 1, "timeout": 1}
+    params = {"offset": last_update_id + 1, "timeout": 0}
     try:
-        async with session.get(url, params=params) as resp:
+        async with session.get(url, params=params, timeout=2) as resp:
             data = await resp.json()
             if data.get("ok") and data.get("result"):
                 for update in data["result"]:
                     last_update_id = update["update_id"]
                     asyncio.create_task(handle_update(session, update))
-    except Exception as e:
-        logging.error(f"Помилка Telegram API: {e}")
+    except Exception:
+        pass
 
 async def main():
     app = web.Application()
@@ -654,7 +659,8 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    async with aiohttp.ClientSession() as session:
+    connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(connector=connector) as session:
         while True:
             await handle_telegram_commands(session)
             await fetch_vinted(session)
