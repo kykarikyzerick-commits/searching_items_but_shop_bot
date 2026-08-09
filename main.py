@@ -16,7 +16,8 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = "8877190549:AAEoSIj_dOL2hi-PpDrfZFJi6h8x40hJnFQ"
 ADMIN_ID = 8138110821
 
-CHECK_INTERVAL = 4
+# Зменшено для прискорення
+CHECK_INTERVAL = 2
 
 ALLOWED_USERS = [8138110821]
 
@@ -224,6 +225,40 @@ async def send_telegram_photo(session, chat_id, photo_url, caption, reply_markup
     async with session.post(url, json=payload) as resp:
         return await resp.json()
 
+# ==================== ВАЛІДАЦІЯ БРЕНДІВ ====================
+async def is_valid_brand(session, brand_name, domain="at"):
+    # Перевірка формату та символів
+    if len(brand_name) < 2 or len(brand_name) > 30:
+        return False, "❌ Назва бренду повинна бути від 2 до 30 символів."
+    
+    if re.search(r"http[s]?://|www\.|@|\.com|\.net", brand_name, re.IGNORECASE):
+        return False, "❌ Назва не повинна містити посилання або спецсимволи."
+
+    if not re.match(r"^[a-zA-Z0-9\s\-\&\.\'\+]+$", brand_name):
+        return False, "❌ Введіть коректну назву бренду (букви, цифри, пробіли, дефіси)."
+
+    # Перевірка реального існування бренду через API Vinted
+    cookie = await get_vinted_cookie(session, domain)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Cookie": cookie
+    }
+    api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={brand_name}&per_page=5"
+    try:
+        async with session.get(api_url, headers=headers, timeout=5) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                items = data.get("items", [])
+                if not items:
+                    return False, f"❌ Бренд або товари з назвою *'{brand_name}'* не знайдені на Vinted."
+            else:
+                return True, ""
+    except Exception:
+        pass
+
+    return True, ""
+
 # ==================== ОБРОБКА ПОВІДОМЛЕНЬ ====================
 async def handle_update(session, update):
     if "message" in update:
@@ -244,7 +279,7 @@ async def handle_update(session, update):
 
         state = user_states.get(chat_id)
 
-        # Адмін-панель команди
+        # Адмін-панель
         if chat_id == ADMIN_ID:
             if text == "👑 Адмін-панель":
                 await send_telegram_message(session, chat_id, "👑 **Адміністративна панель:**", get_admin_keyboard())
@@ -295,7 +330,7 @@ async def handle_update(session, update):
                     await send_telegram_message(session, chat_id, msg_list, get_admin_keyboard())
                 return
 
-        # Перевірка на вибір регіону
+        # Перевірка регіону
         clean_reg_text = text.replace("✅ ", "")
         if clean_reg_text in DOMAINS:
             code = DOMAINS[clean_reg_text]["code"]
@@ -304,7 +339,7 @@ async def handle_update(session, update):
             await send_telegram_message(session, chat_id, f"✅ Регіон змінено на: *{clean_reg_text}*", get_region_panel_keyboard(chat_id))
             return
 
-        # Обробка вибору розмірів з панелі
+        # Обробка розмірів
         clean_size = text.replace("✅ ", "")
         if clean_size in SIZES_LIST:
             sizes = user_settings.setdefault(uid_str, {}).get("sizes", [])
@@ -317,16 +352,27 @@ async def handle_update(session, update):
             await send_telegram_message(session, chat_id, "📏 Оновлено розміри на панелі:", get_sizes_panel_keyboard(chat_id))
             return
 
+        # Додавання бренду з додатковими перевірками
         if state == "waiting_add_brand":
-            brands = user_settings.setdefault(uid_str, {}).get("brands", [])
-            if text not in brands:
-                brands.append(text)
-                user_settings[uid_str]["brands"] = brands
-                save_settings(user_settings)
-                await send_telegram_message(session, chat_id, f"✅ Бренд *{text}* додано!", get_main_keyboard(chat_id))
-            else:
-                await send_telegram_message(session, chat_id, "⚠️ Цей бренд вже є у списку.", get_main_keyboard(chat_id))
             user_states[chat_id] = None
+            brands = user_settings.setdefault(uid_str, {}).get("brands", [])
+
+            # Перевірка на дублікати (без урахування регістру)
+            if any(b.lower() == text.lower() for b in brands):
+                await send_telegram_message(session, chat_id, "⚠️ Цей бренд вже є у вашому списку!", get_main_keyboard(chat_id))
+                return
+
+            # Валідація назви бренду
+            domain = user_settings.get(uid_str, {}).get("domain", "at")
+            is_valid, err_msg = await is_valid_brand(session, text, domain)
+            if not is_valid:
+                await send_telegram_message(session, chat_id, err_msg, get_main_keyboard(chat_id))
+                return
+
+            brands.append(text)
+            user_settings[uid_str]["brands"] = brands
+            save_settings(user_settings)
+            await send_telegram_message(session, chat_id, f"✅ Бренд *{text}* успішно додано!", get_main_keyboard(chat_id))
             return
 
         if state == "waiting_custom_price":
@@ -368,7 +414,7 @@ async def handle_update(session, update):
                 await send_telegram_message(session, chat_id, "❌ **Невірний або вже використаний ключ.**", get_main_keyboard(chat_id))
             return
 
-        # Перевірка активації / стану ключа
+        # Перевірка ключа
         if text in ["🔑 Активувати ключ", "🔑 Активація / Стан ключа", "🔑 Активувати новий ключ"]:
             time_left = get_key_remaining_time(chat_id)
             if time_left:
@@ -387,7 +433,7 @@ async def handle_update(session, update):
             await send_telegram_message(session, chat_id, "🔒 **Доступ обмежено!** Натисніть кнопку активації ключа.", get_main_keyboard(chat_id))
             return
 
-        # Меню команд
+        # Команди меню
         if text == "➕ Додати бренд (МП)":
             user_states[chat_id] = "waiting_add_brand"
             await send_telegram_message(session, chat_id, "Введіть назву бренду для додавання в пошук:")
@@ -438,7 +484,7 @@ async def handle_update(session, update):
                 save_settings(user_settings)
             await send_telegram_message(session, chat_id, "⏹ Пошук зупинено.", get_main_keyboard(chat_id))
 
-# ==================== ОНОВЛЕНИЙ МУЛЬТИПАРСИНГ VINTED ====================
+# ==================== ОПТИМІЗОВАНИЙ ПАРСИНГ VINTED ====================
 async def get_vinted_cookie(session, domain):
     if domain in vinted_cookies and vinted_cookies[domain]:
         return vinted_cookies[domain]
@@ -459,7 +505,90 @@ async def get_vinted_cookie(session, domain):
     except Exception:
         return ""
 
+async def process_brand_search(session, user_id, target_brand, domain, user_sizes, user_price_str, currency_symbol, headers):
+    api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={target_brand}&order=newest_first&per_page=15"
+    try:
+        async with session.get(api_url, headers=headers, timeout=8) as resp:
+            if resp.status in (401, 403, 429):
+                vinted_cookies.pop(domain, None)
+                return
+
+            if resp.status == 200:
+                data = await resp.json()
+                items = data.get("items", [])
+
+                for item in items:
+                    if item.get("promoted") or item.get("is_promoted"):
+                        continue
+
+                    item_id = item.get("id")
+                    if not item_id or item_id in seen_items:
+                        continue
+
+                    title = str(item.get("title", ""))
+                    description = str(item.get("description", ""))
+                    item_brand = str(item.get("brand_title", ""))
+                    full_text = f"{title} {description} {item_brand}".lower()
+
+                    if target_brand.lower() not in full_text:
+                        continue
+
+                    if any(fake_word in full_text for fake_word in FAKE_KEYWORDS):
+                        continue
+
+                    item_price = 0.0
+                    raw_price = item.get("price")
+                    if isinstance(raw_price, (int, float, str)):
+                        try: item_price = float(raw_price)
+                        except ValueError: pass
+                    elif isinstance(raw_price, dict):
+                        try: item_price = float(raw_price.get("amount", 0))
+                        except ValueError: pass
+
+                    if item_price == 0.0 and item.get("price_numeric"):
+                        try: item_price = float(item.get("price_numeric"))
+                        except ValueError: pass
+
+                    if "Будь-яка" not in user_price_str:
+                        digits = re.findall(r"\d+(?:\.\d+)?", user_price_str.replace(",", "."))
+                        if digits:
+                            max_p = float(digits[-1])
+                            if item_price > max_p:
+                                continue
+
+                    size_title = str(item.get("size_title", "")).upper()
+                    if user_sizes:
+                        if not any(s.upper() in size_title for s in user_sizes):
+                            continue
+
+                    seen_items.add(item_id)
+
+                    item_brand_display = item_brand if item_brand else target_brand
+                    item_url = item.get("url", f"https://www.vinted.{domain}")
+                    photo_data = item.get("photo", {})
+                    photo_url = photo_data.get("url") if photo_data else None
+
+                    price_display = f"{item_price:.2f}" if item_price > 0 else "За запитом"
+
+                    caption = (
+                        f"⚡️ **НОВА ЗНАХІДКА VINTED** ⚡️\n\n"
+                        f"🏷 **Назва:** {title}\n"
+                        f"💰 **Ціна:** {price_display} {currency_symbol}\n"
+                        f"📌 **Бренд:** {item_brand_display}\n"
+                        f"📏 **Розмір:** {size_title or 'Не вказано'}"
+                    )
+
+                    keyboard = get_item_keyboard(item_url)
+
+                    if photo_url:
+                        asyncio.create_task(send_telegram_photo(session, user_id, photo_url, caption, keyboard))
+                    else:
+                        asyncio.create_task(send_telegram_message(session, user_id, caption, keyboard))
+    except Exception as e:
+        logging.error(f"Помилка МП парсингу: {e}")
+
 async def fetch_vinted(session):
+    tasks = []
     for uid_str, config in list(user_settings.items()):
         if not config.get("active") or not config.get("brands"):
             continue
@@ -489,88 +618,16 @@ async def fetch_vinted(session):
             "Cookie": cookie
         }
 
+        # Асинхронний паралельний запуск перевірки для кожного бренду
         for target_brand in target_brands:
-            api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={target_brand}&order=newest_first&per_page=15"
+            tasks.append(
+                process_brand_search(
+                    session, user_id, target_brand, domain, user_sizes, user_price_str, currency_symbol, headers
+                )
+            )
 
-            try:
-                async with session.get(api_url, headers=headers, timeout=10) as resp:
-                    if resp.status in (401, 403, 429):
-                        vinted_cookies.pop(domain, None)
-                        continue
-
-                    if resp.status == 200:
-                        data = await resp.json()
-                        items = data.get("items", [])
-
-                        for item in items:
-                            if item.get("promoted") or item.get("is_promoted"):
-                                continue
-
-                            item_id = item.get("id")
-                            if not item_id or item_id in seen_items:
-                                continue
-
-                            title = str(item.get("title", ""))
-                            description = str(item.get("description", ""))
-                            item_brand = str(item.get("brand_title", ""))
-                            full_text = f"{title} {description} {item_brand}".lower()
-
-                            if target_brand.lower() not in full_text:
-                                continue
-
-                            if any(fake_word in full_text for fake_word in FAKE_KEYWORDS):
-                                continue
-
-                            item_price = 0.0
-                            raw_price = item.get("price")
-                            if isinstance(raw_price, (int, float, str)):
-                                try: item_price = float(raw_price)
-                                except ValueError: pass
-                            elif isinstance(raw_price, dict):
-                                try: item_price = float(raw_price.get("amount", 0))
-                                except ValueError: pass
-
-                            if item_price == 0.0 and item.get("price_numeric"):
-                                try: item_price = float(item.get("price_numeric"))
-                                except ValueError: pass
-
-                            if "Будь-яка" not in user_price_str:
-                                digits = re.findall(r"\d+(?:\.\d+)?", user_price_str.replace(",", "."))
-                                if digits:
-                                    max_p = float(digits[-1])
-                                    if item_price > max_p:
-                                        continue
-
-                            size_title = str(item.get("size_title", "")).upper()
-                            if user_sizes:
-                                if not any(s.upper() in size_title for s in user_sizes):
-                                    continue
-
-                            seen_items.add(item_id)
-
-                            item_brand_display = item_brand if item_brand else target_brand
-                            item_url = item.get("url", f"https://www.vinted.{domain}")
-                            photo_data = item.get("photo", {})
-                            photo_url = photo_data.get("url") if photo_data else None
-
-                            price_display = f"{item_price:.2f}" if item_price > 0 else "За запитом"
-
-                            caption = (
-                                f"⚡️ **НОВА ЗНАХІДКА VINTED** ⚡️\n\n"
-                                f"🏷 **Назва:** {title}\n"
-                                f"💰 **Ціна:** {price_display} {currency_symbol}\n"
-                                f"📌 **Бренд:** {item_brand_display}\n"
-                                f"📏 **Розмір:** {size_title or 'Не вказано'}"
-                            )
-
-                            keyboard = get_item_keyboard(item_url)
-
-                            if photo_url:
-                                asyncio.create_task(send_telegram_photo(session, user_id, photo_url, caption, keyboard))
-                            else:
-                                asyncio.create_task(send_telegram_message(session, user_id, caption, keyboard))
-            except Exception as e:
-                logging.error(f"Помилка МП парсингу: {e}")
+    if tasks:
+        await asyncio.gather(*tasks)
 
 # ==================== ОСНОВНИЙ ЦИКЛ ====================
 async def handle_telegram_commands(session):
