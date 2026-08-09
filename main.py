@@ -14,8 +14,8 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = "8877190549:AAEoSIj_dOL2hi-PpDrfZFJi6h8x40hJnFQ"
 ADMIN_ID = 8138110821
 
-# Збільшено інтервал до 12 секунд для захисту від блокування IP на Render
-CHECK_INTERVAL = 12
+# Зменшено інтервал для прискорення пошуку
+CHECK_INTERVAL = 4
 
 ALLOWED_USERS = [8138110821]
 
@@ -428,6 +428,12 @@ async def fetch_vinted(session):
         user_sizes = config.get("sizes", [])
         user_price_str = config.get("price", "Будь-яка ціна")
 
+        currency_symbol = "€"
+        for reg in DOMAINS.values():
+            if reg["code"] == domain:
+                currency_symbol = reg["currency"]
+                break
+
         cookie = await get_vinted_cookie(session, domain)
 
         headers = {
@@ -471,7 +477,7 @@ async def fetch_vinted(session):
                         if any(fake_word in full_text for fake_word in FAKE_KEYWORDS):
                             continue
 
-                        # 3. Фільтр ціни
+                        # 3. Фільтр ціни та отримання її значення
                         try:
                             item_price = float(item.get("price", 0))
                         except (ValueError, TypeError):
@@ -506,6 +512,7 @@ async def fetch_vinted(session):
                         caption = (
                             f"⚡️ **НОВА ЗНАХІДКА VINTED** ⚡️\n\n"
                             f"🏷 **Назва:** {title}\n"
+                            f"💰 **Ціна:** {item_price} {currency_symbol}\n"
                             f"📌 **Бренд:** {item_brand_display}\n"
                             f"📏 **Розмір:** {size_title or 'Не вказано'}\n"
                             f"🛡 **Продавець:** {seller_status}"
