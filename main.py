@@ -2,8 +2,10 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
+import string
 from datetime import datetime, timedelta
 import aiohttp
 from aiohttp import web
@@ -47,11 +49,13 @@ DOMAINS = {
     "🇬🇧 Великобританія": {"code": "co.uk", "currency": "GBP"}
 }
 
+DB_PATH = "licenses.db"
+
 async def health_check(request):
     return web.Response(text="Bot is running 24/7!")
 
 def init_db():
-    conn = sqlite3.connect("licenses.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS keys (
@@ -65,30 +69,44 @@ def init_db():
     conn.commit()
     conn.close()
 
+def generate_random_key(days):
+    rand_str = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    key_code = f"VINTED-{days}D-{rand_str}"
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO keys (key, duration_days, is_used) VALUES (?, ?, 0)", (key_code, days))
+    conn.commit()
+    conn.close()
+    return key_code
+
 def is_user_active(user_id):
     if user_id in ALLOWED_USERS or user_id == ADMIN_ID:
         return True
 
-    conn = sqlite3.connect("licenses.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT expires_at FROM keys WHERE used_by = ? AND is_used = 1", (user_id,))
-    row = cursor.fetchone()
+    rows = cursor.fetchall()
     conn.close()
-    if row and row[0]:
-        try:
-            exp_date = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
-            return exp_date > datetime.now()
-        except Exception:
-            return False
+    
+    for row in rows:
+        if row and row[0]:
+            try:
+                exp_date = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+                if exp_date > datetime.now():
+                    return True
+            except Exception:
+                continue
     return False
 
 def get_key_remaining_time(user_id):
     if user_id in ALLOWED_USERS or user_id == ADMIN_ID:
         return "Безлімітний доступ (Адмін/VIP)"
 
-    conn = sqlite3.connect("licenses.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT expires_at FROM keys WHERE used_by = ? AND is_used = 1", (user_id,))
+    cursor.execute("SELECT expires_at FROM keys WHERE used_by = ? AND is_used = 1 ORDER BY expires_at DESC", (user_id,))
     row = cursor.fetchone()
     conn.close()
 
@@ -139,6 +157,16 @@ def get_main_keyboard(user_id):
     if user_id == ADMIN_ID:
         kb.append([{"text": "👑 Адмін-панель"}])
     return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
+
+def get_admin_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "➕ Згенерувати ключ"}, {"text": "📊 Статистика"}],
+            [{"text": "📋 Список ключів"}, {"text": "🔙 Головне меню"}]
+        ],
+        "resize_keyboard": True,
+        "persistent": True
+    }
 
 def get_sizes_panel_keyboard(user_id):
     uid_str = str(user_id)
@@ -216,7 +244,58 @@ async def handle_update(session, update):
 
         state = user_states.get(chat_id)
 
-        # Перевірка на вибір регіону з нижньої панелі
+        # Адмін-панель команди
+        if chat_id == ADMIN_ID:
+            if text == "👑 Адмін-панель":
+                await send_telegram_message(session, chat_id, "👑 **Адміністративна панель:**", get_admin_keyboard())
+                return
+
+            if text == "➕ Згенерувати ключ":
+                user_states[chat_id] = "waiting_gen_days"
+                await send_telegram_message(session, chat_id, "Введіть термін дії ключа в днях (число, наприклад: `30`):")
+                return
+
+            if state == "waiting_gen_days":
+                if text.isdigit():
+                    days = int(text)
+                    new_key = generate_random_key(days)
+                    await send_telegram_message(session, chat_id, f"✅ **Ключ успішно створено!**\n\n`{new_key}`\n\nТермін дії: *{days} днів*", get_admin_keyboard())
+                else:
+                    await send_telegram_message(session, chat_id, "❌ Будь ласка, введіть тільки число цифрами.", get_admin_keyboard())
+                user_states[chat_id] = None
+                return
+
+            if text == "📊 Статистика":
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM keys")
+                total_keys = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM keys WHERE is_used = 1")
+                used_keys = cursor.fetchone()[0]
+                conn.close()
+
+                stat_msg = f"📊 **Статистика бота:**\n\n🔑 Всього ключів: *{total_keys}*\n✅ Активовано ключів: *{used_keys}*\n👥 Активних користувачів у файлі: *{len(user_settings)}*"
+                await send_telegram_message(session, chat_id, stat_msg, get_admin_keyboard())
+                return
+
+            if text == "📋 Список ключів":
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                cursor.execute("SELECT key, duration_days, is_used, expires_at FROM keys ORDER BY is_used ASC LIMIT 20")
+                rows = cursor.fetchall()
+                conn.close()
+
+                if not rows:
+                    await send_telegram_message(session, chat_id, "📋 Список ключів порожній.", get_admin_keyboard())
+                else:
+                    msg_list = "📋 **Останні ключі:**\n\n"
+                    for r in rows:
+                        st = "❌ Використаний" if r[2] == 1 else "🟢 Вільний"
+                        msg_list += f"`{r[0]}` | {r[1]} дн. | {st}\n"
+                    await send_telegram_message(session, chat_id, msg_list, get_admin_keyboard())
+                return
+
+        # Перевірка на вибір регіону
         clean_reg_text = text.replace("✅ ", "")
         if clean_reg_text in DOMAINS:
             code = DOMAINS[clean_reg_text]["code"]
@@ -262,13 +341,13 @@ async def handle_update(session, update):
             if text in MASTER_KEYS:
                 days_to_add = MASTER_KEYS[text]
             else:
-                conn = sqlite3.connect("licenses.db")
+                conn = sqlite3.connect(DB_PATH)
                 cursor = conn.cursor()
                 cursor.execute("SELECT duration_days, is_used FROM keys WHERE key = ?", (text,))
                 row = cursor.fetchone()
                 if row and row[1] == 0:
                     days_to_add = row[0]
-                    cursor.execute("UPDATE keys SET is_used = 1 WHERE key = ?", (text,))
+                    cursor.execute("UPDATE keys SET is_used = 1, used_by = ? WHERE key = ?", (chat_id, text))
                     conn.commit()
                 conn.close()
 
@@ -276,7 +355,7 @@ async def handle_update(session, update):
                 exp_date = datetime.now() + timedelta(days=days_to_add)
                 exp_str = exp_date.strftime("%Y-%m-%d %H:%M:%S")
 
-                conn = sqlite3.connect("licenses.db")
+                conn = sqlite3.connect(DB_PATH)
                 cursor = conn.cursor()
                 cursor.execute("INSERT OR REPLACE INTO keys (key, duration_days, is_used, used_by, expires_at) VALUES (?, ?, 1, ?, ?)",
                                (text, days_to_add, chat_id, exp_str))
@@ -305,7 +384,7 @@ async def handle_update(session, update):
             return
 
         if not is_user_active(chat_id):
-            await send_telegram_message(session, chat_id, "🔒 **Доступ обмежено!** Натисніть кнопку активації keys.", get_main_keyboard(chat_id))
+            await send_telegram_message(session, chat_id, "🔒 **Доступ обмежено!** Натисніть кнопку активації ключа.", get_main_keyboard(chat_id))
             return
 
         # Меню команд
