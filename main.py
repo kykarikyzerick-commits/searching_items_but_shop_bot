@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import os
 import random
@@ -8,12 +7,16 @@ import string
 from datetime import datetime, timedelta
 import aiohttp
 from aiohttp import web
+from motor.motor_asyncio import AsyncIOMotorClient
 
 logging.basicConfig(level=logging.INFO)
 
 # ==================== НАЛАШТУВАННЯ ====================
 BOT_TOKEN = "8877190549:AAEoSIj_dOL2hi-PpDrfZFJi6h8x40hJnFQ"
 ADMIN_ID = 8138110821
+
+# Рядок підключення до вашої MongoDB Atlas
+MONGO_URI = "mongodb+srv://illya:2010@cluster0.p71v9.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 
 CHECK_INTERVAL = 2
 
@@ -48,80 +51,103 @@ DOMAINS = {
     "🇬🇧 Великобританія": {"code": "co.uk", "currency": "GBP"}
 }
 
-# ==================== ЗБЕРЕЖЕННЯ ДАНИХ (JSON) ====================
-KEYS_FILE = "keys.json"
-SETTINGS_FILE = "settings.json"
+# ==================== MONGODB СТАН ТА ЗМІННІ ====================
+mongo_client = AsyncIOMotorClient(MONGO_URI)
+db = mongo_client["vinted_bot_db"]
+keys_collection = db["keys"]
+settings_collection = db["user_settings"]
 
-def load_data(filename):
-    if os.path.exists(filename):
-        try:
-            with open(filename, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-def save_data(filename, data):
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-
-db_keys = load_data(KEYS_FILE)
-user_settings = load_data(SETTINGS_FILE)
 user_states = {}
 seen_items = set()
 last_update_id = 0
 vinted_cookies = {}
 
+# ==================== РОБОТА З БД (MONGODB) ====================
+async def get_user_settings(user_id):
+    uid_str = str(user_id)
+    doc = await settings_collection.find_one({"user_id": uid_str})
+    if not doc:
+        doc = {
+            "user_id": uid_str,
+            "brands": [],
+            "sizes": [],
+            "price": "Будь-яка ціна",
+            "domain": "at",
+            "active": False
+        }
+        await settings_collection.insert_one(doc)
+    return doc
+
+async def save_user_settings(user_id, settings):
+    uid_str = str(user_id)
+    settings["user_id"] = uid_str
+    await settings_collection.update_one(
+        {"user_id": uid_str},
+        {"$set": settings},
+        upsert=True
+    )
+
+async def get_key_data(key_code):
+    return await keys_collection.find_one({"key": key_code})
+
+async def save_key_data(key_code, data):
+    data["key"] = key_code
+    await keys_collection.update_one(
+        {"key": key_code},
+        {"$set": data},
+        upsert=True
+    )
+
 async def health_check(request):
     return web.Response(text="Bot is running 24/7!")
 
-def generate_random_key(days):
+async def generate_random_key(days):
     rand_str = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
     key_code = f"VINTED-{days}D-{rand_str}"
     
-    db_keys[key_code] = {
+    key_doc = {
         "duration_days": days,
         "is_used": False,
         "used_by": None,
         "expires_at": None
     }
-    save_data(KEYS_FILE, db_keys)
+    await save_key_data(key_code, key_doc)
     return key_code
 
-def is_user_active(user_id):
+async def is_user_active(user_id):
     if user_id in ALLOWED_USERS or user_id == ADMIN_ID:
         return True
 
     now = datetime.now()
-    for key, data in db_keys.items():
-        if data.get("used_by") == user_id and data.get("is_used"):
-            exp_str = data.get("expires_at")
-            if exp_str:
-                try:
-                    exp_date = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S")
-                    if exp_date > now:
-                        return True
-                except Exception:
-                    continue
+    cursor = keys_collection.find({"used_by": user_id, "is_used": True})
+    async for data in cursor:
+        exp_str = data.get("expires_at")
+        if exp_str:
+            try:
+                exp_date = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S")
+                if exp_date > now:
+                    return True
+            except Exception:
+                continue
     return False
 
-def get_key_remaining_time(user_id):
+async def get_key_remaining_time(user_id):
     if user_id in ALLOWED_USERS or user_id == ADMIN_ID:
         return "Безлімітний доступ (Адмін/VIP)"
 
     now = datetime.now()
     latest_exp = None
-    for key, data in db_keys.items():
-        if data.get("used_by") == user_id and data.get("is_used"):
-            exp_str = data.get("expires_at")
-            if exp_str:
-                try:
-                    exp_date = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S")
-                    if exp_date > now:
-                        if not latest_exp or exp_date > latest_exp:
-                            latest_exp = exp_date
-                except Exception:
-                    pass
+    cursor = keys_collection.find({"used_by": user_id, "is_used": True})
+    async for data in cursor:
+        exp_str = data.get("expires_at")
+        if exp_str:
+            try:
+                exp_date = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S")
+                if exp_date > now:
+                    if not latest_exp or exp_date > latest_exp:
+                        latest_exp = exp_date
+            except Exception:
+                pass
 
     if latest_exp:
         diff = latest_exp - now
@@ -132,9 +158,9 @@ def get_key_remaining_time(user_id):
     return None
 
 # ==================== КЛАВІАТУРИ НИЖНЬОЇ ПАНЕЛІ ====================
-def get_main_keyboard(user_id):
+async def get_main_keyboard(user_id):
     kb = []
-    if not is_user_active(user_id):
+    if not await is_user_active(user_id):
         kb.append([{"text": "🔑 Активувати ключ"}, {"text": "🛒 Придбати ключ"}])
         return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
 
@@ -157,9 +183,9 @@ def get_admin_keyboard():
         "persistent": True
     }
 
-def get_sizes_panel_keyboard(user_id):
-    uid_str = str(user_id)
-    selected = user_settings.get(uid_str, {}).get("sizes", [])
+async def get_sizes_panel_keyboard(user_id):
+    cfg = await get_user_settings(user_id)
+    selected = cfg.get("sizes", [])
     kb = []
     row = []
     for sz in SIZES_LIST:
@@ -173,9 +199,9 @@ def get_sizes_panel_keyboard(user_id):
     kb.append([{"text": "🧹 Очистити розміри"}, {"text": "🔙 Головне меню"}])
     return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
 
-def get_region_panel_keyboard(user_id):
-    uid_str = str(user_id)
-    curr = user_settings.get(uid_str, {}).get("domain", "at")
+async def get_region_panel_keyboard(user_id):
+    cfg = await get_user_settings(user_id)
+    curr = cfg.get("domain", "at")
     kb = []
     row = []
     for name, data in DOMAINS.items():
@@ -251,7 +277,6 @@ async def handle_update(session, update):
         msg = update["message"]
         chat_id = msg["chat"]["id"]
         text = msg.get("text", "").strip()
-        uid_str = str(chat_id)
 
         if text in ["/start", "меню", "Start", "start", "🔙 Головне меню"]:
             user_states[chat_id] = None
@@ -259,7 +284,7 @@ async def handle_update(session, update):
                 session, 
                 chat_id, 
                 "👋 **Панель керування бота:**", 
-                get_main_keyboard(chat_id)
+                await get_main_keyboard(chat_id)
             )
             return
 
@@ -279,7 +304,7 @@ async def handle_update(session, update):
             if state == "waiting_gen_days":
                 if text.isdigit():
                     days = int(text)
-                    new_key = generate_random_key(days)
+                    new_key = await generate_random_key(days)
                     await send_telegram_message(session, chat_id, f"✅ **Ключ успішно створено!**\n\n`{new_key}`\n\nТермін дії: *{days} днів*", get_admin_keyboard())
                 else:
                     await send_telegram_message(session, chat_id, "❌ Будь ласка, введіть тільки число цифрами.", get_admin_keyboard())
@@ -287,116 +312,124 @@ async def handle_update(session, update):
                 return
 
             if text == "📊 Статистика":
-                total_keys = len(db_keys)
-                used_keys = sum(1 for k in db_keys.values() if k.get("is_used"))
+                total_keys = await keys_collection.count_documents({})
+                used_keys = await keys_collection.count_documents({"is_used": True})
+                total_users = await settings_collection.count_documents({})
 
-                stat_msg = f"📊 **Статистика бота:**\n\n🔑 Всього ключів: *{total_keys}*\n✅ Активовано ключів: *{used_keys}*\n👥 Активних користувачів: *{len(user_settings)}*"
+                stat_msg = f"📊 **Статистика бота:**\n\n🔑 Всього ключів: *{total_keys}*\n✅ Активовано ключів: *{used_keys}*\n👥 Активних користувачів: *{total_users}*"
                 await send_telegram_message(session, chat_id, stat_msg, get_admin_keyboard())
                 return
 
             if text == "📋 Список ключів":
-                if not db_keys:
+                keys_cursor = keys_collection.find().limit(20)
+                keys_list = await keys_cursor.to_list(length=20)
+                if not keys_list:
                     await send_telegram_message(session, chat_id, "📋 Список ключів порожній.", get_admin_keyboard())
                 else:
                     msg_list = "📋 **Останні ключі:**\n\n"
-                    for k, val in list(db_keys.items())[-20:]:
+                    for val in keys_list:
                         st = "❌ Використаний" if val.get("is_used") else "🟢 Вільний"
-                        msg_list += f"`{k}` | {val.get('duration_days')} дн. | {st}\n"
+                        msg_list += f"`{val.get('key')}` | {val.get('duration_days')} дн. | {st}\n"
                     await send_telegram_message(session, chat_id, msg_list, get_admin_keyboard())
                 return
 
         # Перевірка регіону
         clean_reg_text = text.replace("✅ ", "")
         if clean_reg_text in DOMAINS:
-            code = DOMAINS[clean_reg_text]["code"]
-            user_settings.setdefault(uid_str, {})["domain"] = code
-            save_data(SETTINGS_FILE, user_settings)
-            await send_telegram_message(session, chat_id, f"✅ Регіон змінено на: *{clean_reg_text}*", get_region_panel_keyboard(chat_id))
+            cfg = await get_user_settings(chat_id)
+            cfg["domain"] = DOMAINS[clean_reg_text]["code"]
+            await save_user_settings(chat_id, cfg)
+            await send_telegram_message(session, chat_id, f"✅ Регіон змінено на: *{clean_reg_text}*", await get_region_panel_keyboard(chat_id))
             return
 
         # Обробка розмірів
         clean_size = text.replace("✅ ", "")
         if clean_size in SIZES_LIST:
-            sizes = user_settings.setdefault(uid_str, {}).get("sizes", [])
+            cfg = await get_user_settings(chat_id)
+            sizes = cfg.get("sizes", [])
             if clean_size in sizes:
                 sizes.remove(clean_size)
             else:
                 sizes.append(clean_size)
-            user_settings[uid_str]["sizes"] = sizes
-            save_data(SETTINGS_FILE, user_settings)
-            await send_telegram_message(session, chat_id, "📏 Оновлено розміри на панелі:", get_sizes_panel_keyboard(chat_id))
+            cfg["sizes"] = sizes
+            await save_user_settings(chat_id, cfg)
+            await send_telegram_message(session, chat_id, "📏 Оновлено розміри на панелі:", await get_sizes_panel_keyboard(chat_id))
             return
 
         # Додавання бренду
         if state == "waiting_add_brand":
             user_states[chat_id] = None
-            brands = user_settings.setdefault(uid_str, {}).get("brands", [])
+            cfg = await get_user_settings(chat_id)
+            brands = cfg.get("brands", [])
 
             if any(b.lower() == text.lower() for b in brands):
-                await send_telegram_message(session, chat_id, "⚠️ Цей бренд вже є у вашому списку!", get_main_keyboard(chat_id))
+                await send_telegram_message(session, chat_id, "⚠️ Цей бренд вже є у вашому списку!", await get_main_keyboard(chat_id))
                 return
 
-            domain = user_settings.get(uid_str, {}).get("domain", "at")
+            domain = cfg.get("domain", "at")
             is_valid, err_msg = await is_valid_brand(session, text, domain)
             if not is_valid:
-                await send_telegram_message(session, chat_id, err_msg, get_main_keyboard(chat_id))
+                await send_telegram_message(session, chat_id, err_msg, await get_main_keyboard(chat_id))
                 return
 
             brands.append(text)
-            user_settings[uid_str]["brands"] = brands
-            save_data(SETTINGS_FILE, user_settings)
-            await send_telegram_message(session, chat_id, f"✅ Бренд *{text}* успішно додано!", get_main_keyboard(chat_id))
+            cfg["brands"] = brands
+            await save_user_settings(chat_id, cfg)
+            await send_telegram_message(session, chat_id, f"✅ Бренд *{text}* успішно додано!", await get_main_keyboard(chat_id))
             return
 
         if state == "waiting_custom_price":
-            user_settings.setdefault(uid_str, {})["price"] = text
-            save_data(SETTINGS_FILE, user_settings)
-            await send_telegram_message(session, chat_id, f"✅ Максимальну ціну встановлено: *{text}*", get_main_keyboard(chat_id))
+            cfg = await get_user_settings(chat_id)
+            cfg["price"] = text
+            await save_user_settings(chat_id, cfg)
+            await send_telegram_message(session, chat_id, f"✅ Максимальну ціну встановлено: *{text}*", await get_main_keyboard(chat_id))
             user_states[chat_id] = None
             return
 
         if state == "waiting_for_key" or text.startswith("VINTED-"):
             days_to_add = None
+            key_doc = await get_key_data(text)
+
             if text in MASTER_KEYS:
                 days_to_add = MASTER_KEYS[text]
-            elif text in db_keys and not db_keys[text].get("is_used"):
-                days_to_add = db_keys[text].get("duration_days")
+            elif key_doc and not key_doc.get("is_used"):
+                days_to_add = key_doc.get("duration_days")
 
             if days_to_add:
                 exp_date = datetime.now() + timedelta(days=days_to_add)
                 exp_str = exp_date.strftime("%Y-%m-%d %H:%M:%S")
 
-                db_keys[text] = {
+                updated_key_data = {
                     "duration_days": days_to_add,
                     "is_used": True,
                     "used_by": chat_id,
                     "expires_at": exp_str
                 }
-                save_data(KEYS_FILE, db_keys)
+                await save_key_data(text, updated_key_data)
 
                 user_states[chat_id] = None
-                await send_telegram_message(session, chat_id, f"🎉 **Ключ успішно активовано на {days_to_add} днів!**", get_main_keyboard(chat_id))
+                await send_telegram_message(session, chat_id, f"🎉 **Ключ успішно активовано на {days_to_add} днів!**", await get_main_keyboard(chat_id))
             else:
-                await send_telegram_message(session, chat_id, "❌ **Невірний або вже використаний ключ.**", get_main_keyboard(chat_id))
+                await send_telegram_message(session, chat_id, "❌ **Невірний або вже використаний ключ.**", await get_main_keyboard(chat_id))
             return
 
         # Перевірка ключа
         if text in ["🔑 Активувати ключ", "🔑 Активація / Стан ключа", "🔑 Активувати новий ключ"]:
-            time_left = get_key_remaining_time(chat_id)
+            time_left = await get_key_remaining_time(chat_id)
             if time_left:
                 await send_telegram_message(
                     session, 
                     chat_id, 
                     f"✅ **Ваш ключ активний!**\n⏱ Залишилося: *{time_left}*\n\nЯкщо ви хочете ввести новий ключ, надішліть його у відповідь:", 
-                    get_main_keyboard(chat_id)
+                    await get_main_keyboard(chat_id)
                 )
             else:
                 user_states[chat_id] = "waiting_for_key"
                 await send_telegram_message(session, chat_id, "Надішліть ваш ключ активації у відповідь:")
             return
 
-        if not is_user_active(chat_id):
-            await send_telegram_message(session, chat_id, "🔒 **Доступ обмежено!** Натисніть кнопку активації ключа.", get_main_keyboard(chat_id))
+        if not await is_user_active(chat_id):
+            await send_telegram_message(session, chat_id, "🔒 **Доступ обмежено!** Натисніть кнопку активації ключа.", await get_main_keyboard(chat_id))
             return
 
         # Команди меню
@@ -405,27 +438,29 @@ async def handle_update(session, update):
             await send_telegram_message(session, chat_id, "Введіть назву бренду для додавання в пошук:")
 
         elif text == "🗑 Очистити бренди":
-            user_settings.setdefault(uid_str, {})["brands"] = []
-            save_data(SETTINGS_FILE, user_settings)
-            await send_telegram_message(session, chat_id, "🗑 Список брендів очищено.", get_main_keyboard(chat_id))
+            cfg = await get_user_settings(chat_id)
+            cfg["brands"] = []
+            await save_user_settings(chat_id, cfg)
+            await send_telegram_message(session, chat_id, "🗑 Список брендів очищено.", await get_main_keyboard(chat_id))
 
         elif text == "📏 Налаштувати розміри":
-            await send_telegram_message(session, chat_id, "Оберіть розміри на нижній панелі:", get_sizes_panel_keyboard(chat_id))
+            await send_telegram_message(session, chat_id, "Оберіть розміри на нижній панелі:", await get_sizes_panel_keyboard(chat_id))
 
         elif text == "🧹 Очистити розміри":
-            user_settings.setdefault(uid_str, {})["sizes"] = []
-            save_data(SETTINGS_FILE, user_settings)
-            await send_telegram_message(session, chat_id, "🧹 Розміри скинуто.", get_sizes_panel_keyboard(chat_id))
+            cfg = await get_user_settings(chat_id)
+            cfg["sizes"] = []
+            await save_user_settings(chat_id, cfg)
+            await send_telegram_message(session, chat_id, "🧹 Розміри скинуто.", await get_main_keyboard(chat_id))
 
         elif text == "🌍 Обрати регіон":
-            await send_telegram_message(session, chat_id, "Оберіть країну з панелі нижче:", get_region_panel_keyboard(chat_id))
+            await send_telegram_message(session, chat_id, "Оберіть країну з панелі нижче:", await get_region_panel_keyboard(chat_id))
 
         elif text == "💵 Макс. Ціна":
             user_states[chat_id] = "waiting_custom_price"
             await send_telegram_message(session, chat_id, "Введіть максимальну ціну цифрами (наприклад: `30`):")
 
         elif text == "📋 Мої налаштування":
-            cfg = user_settings.get(uid_str, {})
+            cfg = await get_user_settings(chat_id)
             brands = ", ".join(cfg.get("brands", [])) or "Не обрано"
             sizes = ", ".join(cfg.get("sizes", [])) or "Всі"
             price = cfg.get("price", "Будь-яка ціна")
@@ -433,22 +468,22 @@ async def handle_update(session, update):
             status = "🟢 Активний" if cfg.get("active") else "🔴 Зупинений"
             
             info = f"⚙️ **Налаштування:**\n\n🏷 **Бренди:** {brands}\n📏 **Розміри:** {sizes}\n💵 **Макс. ціна:** {price}\n🌍 **Регіон:** {domain}\n📡 **Статус:** {status}"
-            await send_telegram_message(session, chat_id, info, get_main_keyboard(chat_id))
+            await send_telegram_message(session, chat_id, info, await get_main_keyboard(chat_id))
 
         elif text == "▶️ Запустити":
-            cfg = user_settings.get(uid_str, {})
+            cfg = await get_user_settings(chat_id)
             if not cfg.get("brands"):
-                await send_telegram_message(session, chat_id, "⚠️ Спочатку додайте хоча б один бренд!", get_main_keyboard(chat_id))
+                await send_telegram_message(session, chat_id, "⚠️ Спочатку додайте хоча б один бренд!", await get_main_keyboard(chat_id))
                 return
-            user_settings.setdefault(uid_str, {})["active"] = True
-            save_data(SETTINGS_FILE, user_settings)
-            await send_telegram_message(session, chat_id, "Пошук запущено", get_main_keyboard(chat_id))
+            cfg["active"] = True
+            await save_user_settings(chat_id, cfg)
+            await send_telegram_message(session, chat_id, "Пошук запущено", await get_main_keyboard(chat_id))
 
         elif text == "⏹ Зупинити":
-            if uid_str in user_settings:
-                user_settings[uid_str]["active"] = False
-                save_data(SETTINGS_FILE, user_settings)
-            await send_telegram_message(session, chat_id, "⏹ Пошук зупинено.", get_main_keyboard(chat_id))
+            cfg = await get_user_settings(chat_id)
+            cfg["active"] = False
+            await save_user_settings(chat_id, cfg)
+            await send_telegram_message(session, chat_id, "⏹ Пошук зупинено.", await get_main_keyboard(chat_id))
 
 # ==================== ОПТИМІЗОВАНИЙ ПАРСИНГ VINTED ====================
 async def get_vinted_cookie(session, domain):
@@ -555,16 +590,17 @@ async def process_brand_search(session, user_id, target_brand, domain, user_size
 
 async def fetch_vinted(session):
     tasks = []
-    for uid_str, config in list(user_settings.items()):
-        if not config.get("active") or not config.get("brands"):
-            continue
-
-        user_id = int(uid_str)
-        if not is_user_active(user_id):
+    cursor = settings_collection.find({"active": True})
+    async for config in cursor:
+        user_id = int(config.get("user_id"))
+        if not await is_user_active(user_id):
             continue
 
         domain = config.get("domain", "at")
         target_brands = config.get("brands", [])
+        if not target_brands:
+            continue
+
         user_sizes = config.get("sizes", [])
         user_price_str = str(config.get("price", "Будь-яка ціна"))
 
