@@ -82,6 +82,29 @@ def is_user_active(user_id):
             return False
     return False
 
+def get_key_remaining_time(user_id):
+    if user_id in ALLOWED_USERS or user_id == ADMIN_ID:
+        return "Безлімітний доступ (Адмін/VIP)"
+
+    conn = sqlite3.connect("licenses.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT expires_at FROM keys WHERE used_by = ? AND is_used = 1", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if row and row[0]:
+        try:
+            exp_date = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+            now = datetime.now()
+            if exp_date > now:
+                diff = exp_date - now
+                days = diff.days
+                hours = diff.seconds // 3600
+                return f"{days} днів, {hours} годин"
+        except Exception:
+            pass
+    return None
+
 def load_settings():
     if os.path.exists("settings.json"):
         try:
@@ -112,7 +135,7 @@ def get_main_keyboard(user_id):
     kb.append([{"text": "📏 Налаштувати розміри"}, {"text": "💵 Макс. Ціна"}])
     kb.append([{"text": "🌍 Обрати регіон"}, {"text": "📋 Мої налаштування"}])
     kb.append([{"text": "▶️ Запустити"}, {"text": "⏹ Зупинити"}])
-    kb.append([{"text": "🔑 Активувати новий ключ"}])
+    kb.append([{"text": "🔑 Активація / Стан ключа"}])
     if user_id == ADMIN_ID:
         kb.append([{"text": "👑 Адмін-панель"}])
     return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
@@ -131,6 +154,22 @@ def get_sizes_panel_keyboard(user_id):
     if row:
         kb.append(row)
     kb.append([{"text": "🧹 Очистити розміри"}, {"text": "🔙 Головне меню"}])
+    return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
+
+def get_region_panel_keyboard(user_id):
+    uid_str = str(user_id)
+    curr = user_settings.get(uid_str, {}).get("domain", "at")
+    kb = []
+    row = []
+    for name, data in DOMAINS.items():
+        prefix = "✅ " if data["code"] == curr else ""
+        row.append({"text": f"{prefix}{name}"})
+        if len(row) == 2:
+            kb.append(row)
+            row = []
+    if row:
+        kb.append(row)
+    kb.append([{"text": "🔙 Головне меню"}])
     return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
 
 def get_item_keyboard(item_url):
@@ -177,31 +216,13 @@ async def handle_update(session, update):
 
         state = user_states.get(chat_id)
 
-        if state == "waiting_add_brand":
-            brands = user_settings.setdefault(uid_str, {}).get("brands", [])
-            if text not in brands:
-                brands.append(text)
-                user_settings[uid_str]["brands"] = brands
-                save_settings(user_settings)
-                await send_telegram_message(session, chat_id, f"✅ Бренд *{text}* додано до списку (МП)!", get_main_keyboard(chat_id))
-            else:
-                await send_telegram_message(session, chat_id, "⚠️ Цей бренд вже є у списку.", get_main_keyboard(chat_id))
-            user_states[chat_id] = None
-            return
-
-        if state == "waiting_custom_price":
-            user_settings.setdefault(uid_str, {})["price"] = text
+        # Перевірка на вибір регіону з нижньої панелі
+        clean_reg_text = text.replace("✅ ", "")
+        if clean_reg_text in DOMAINS:
+            code = DOMAINS[clean_reg_text]["code"]
+            user_settings.setdefault(uid_str, {})["domain"] = code
             save_settings(user_settings)
-            await send_telegram_message(session, chat_id, f"✅ Максимальну ціну встановлено: *{text}*", get_main_keyboard(chat_id))
-            user_states[chat_id] = None
-            return
-
-        if not is_user_active(chat_id):
-            if text in ["🔑 Активувати ключ", "🔑 Активувати новий ключ"]:
-                user_states[chat_id] = "waiting_for_key"
-                await send_telegram_message(session, chat_id, "Надішліть ваш ключ активації у відповідь:")
-            else:
-                await send_telegram_message(session, chat_id, "🔒 **Доступ обмежено!** Активуйте ключ.", get_main_keyboard(chat_id))
+            await send_telegram_message(session, chat_id, f"✅ Регіон змінено на: *{clean_reg_text}*", get_region_panel_keyboard(chat_id))
             return
 
         # Обробка вибору розмірів з панелі
@@ -217,10 +238,74 @@ async def handle_update(session, update):
             await send_telegram_message(session, chat_id, "📏 Оновлено розміри на панелі:", get_sizes_panel_keyboard(chat_id))
             return
 
-        if text == "🧹 Очистити розміри":
-            user_settings.setdefault(uid_str, {})["sizes"] = []
+        if state == "waiting_add_brand":
+            brands = user_settings.setdefault(uid_str, {}).get("brands", [])
+            if text not in brands:
+                brands.append(text)
+                user_settings[uid_str]["brands"] = brands
+                save_settings(user_settings)
+                await send_telegram_message(session, chat_id, f"✅ Бренд *{text}* додано!", get_main_keyboard(chat_id))
+            else:
+                await send_telegram_message(session, chat_id, "⚠️ Цей бренд вже є у списку.", get_main_keyboard(chat_id))
+            user_states[chat_id] = None
+            return
+
+        if state == "waiting_custom_price":
+            user_settings.setdefault(uid_str, {})["price"] = text
             save_settings(user_settings)
-            await send_telegram_message(session, chat_id, "🧹 Розміри скинуто.", get_sizes_panel_keyboard(chat_id))
+            await send_telegram_message(session, chat_id, f"✅ Максимальну ціну встановлено: *{text}*", get_main_keyboard(chat_id))
+            user_states[chat_id] = None
+            return
+
+        if state == "waiting_for_key" or text.startswith("VINTED-"):
+            days_to_add = None
+            if text in MASTER_KEYS:
+                days_to_add = MASTER_KEYS[text]
+            else:
+                conn = sqlite3.connect("licenses.db")
+                cursor = conn.cursor()
+                cursor.execute("SELECT duration_days, is_used FROM keys WHERE key = ?", (text,))
+                row = cursor.fetchone()
+                if row and row[1] == 0:
+                    days_to_add = row[0]
+                    cursor.execute("UPDATE keys SET is_used = 1 WHERE key = ?", (text,))
+                    conn.commit()
+                conn.close()
+
+            if days_to_add:
+                exp_date = datetime.now() + timedelta(days=days_to_add)
+                exp_str = exp_date.strftime("%Y-%m-%d %H:%M:%S")
+
+                conn = sqlite3.connect("licenses.db")
+                cursor = conn.cursor()
+                cursor.execute("INSERT OR REPLACE INTO keys (key, duration_days, is_used, used_by, expires_at) VALUES (?, ?, 1, ?, ?)",
+                               (text, days_to_add, chat_id, exp_str))
+                conn.commit()
+                conn.close()
+
+                user_states[chat_id] = None
+                await send_telegram_message(session, chat_id, f"🎉 **Ключ успішно активовано на {days_to_add} днів!**", get_main_keyboard(chat_id))
+            else:
+                await send_telegram_message(session, chat_id, "❌ **Невірний або вже використаний ключ.**", get_main_keyboard(chat_id))
+            return
+
+        # Перевірка активації / стану ключа
+        if text in ["🔑 Активувати ключ", "🔑 Активація / Стан ключа", "🔑 Активувати новий ключ"]:
+            time_left = get_key_remaining_time(chat_id)
+            if time_left:
+                await send_telegram_message(
+                    session, 
+                    chat_id, 
+                    f"✅ **Ваш ключ активний!**\n⏱ Залишилося: *{time_left}*\n\nЯкщо ви хочете ввести новий ключ, надішліть його у відповідь:", 
+                    get_main_keyboard(chat_id)
+                )
+            else:
+                user_states[chat_id] = "waiting_for_key"
+                await send_telegram_message(session, chat_id, "Надішліть ваш ключ активації у відповідь:")
+            return
+
+        if not is_user_active(chat_id):
+            await send_telegram_message(session, chat_id, "🔒 **Доступ обмежено!** Натисніть кнопку активації keys.", get_main_keyboard(chat_id))
             return
 
         # Меню команд
@@ -236,6 +321,14 @@ async def handle_update(session, update):
         elif text == "📏 Налаштувати розміри":
             await send_telegram_message(session, chat_id, "Оберіть розміри на нижній панелі:", get_sizes_panel_keyboard(chat_id))
 
+        elif text == "🧹 Очистити розміри":
+            user_settings.setdefault(uid_str, {})["sizes"] = []
+            save_settings(user_settings)
+            await send_telegram_message(session, chat_id, "🧹 Розміри скинуто.", get_sizes_panel_keyboard(chat_id))
+
+        elif text == "🌍 Обрати регіон":
+            await send_telegram_message(session, chat_id, "Оберіть країну з панелі нижче:", get_region_panel_keyboard(chat_id))
+
         elif text == "💵 Макс. Ціна":
             user_states[chat_id] = "waiting_custom_price"
             await send_telegram_message(session, chat_id, "Введіть максимальну ціну цифрами (наприклад: `30`):")
@@ -248,7 +341,7 @@ async def handle_update(session, update):
             domain = cfg.get("domain", "at").upper()
             status = "🟢 Активний" if cfg.get("active") else "🔴 Зупинений"
             
-            info = f"⚙️ **Налаштування (МП):**\n\n🏷 **Бренди:** {brands}\n📏 **Розміри:** {sizes}\n💵 **Макс. ціна:** {price}\n🌍 **Регіон:** {domain}\n📡 **Статус:** {status}"
+            info = f"⚙️ **Налаштування:**\n\n🏷 **Бренди:** {brands}\n📏 **Розміри:** {sizes}\n💵 **Макс. ціна:** {price}\n🌍 **Регіон:** {domain}\n📡 **Статус:** {status}"
             await send_telegram_message(session, chat_id, info, get_main_keyboard(chat_id))
 
         elif text == "▶️ Запустити":
@@ -258,7 +351,7 @@ async def handle_update(session, update):
                 return
             user_settings.setdefault(uid_str, {})["active"] = True
             save_settings(user_settings)
-            await send_telegram_message(session, chat_id, "🚀 **Мультипошук запущено!**", get_main_keyboard(chat_id))
+            await send_telegram_message(session, chat_id, "Пошук запущено", get_main_keyboard(chat_id))
 
         elif text == "⏹ Зупинити":
             if uid_str in user_settings:
@@ -301,7 +394,12 @@ async def fetch_vinted(session):
         user_sizes = config.get("sizes", [])
         user_price_str = str(config.get("price", "Будь-яка ціна"))
 
-        currency_symbol = DOMAINS.get(domain, {}).get("currency", "EUR")
+        currency_symbol = "EUR"
+        for reg in DOMAINS.values():
+            if reg["code"] == domain:
+                currency_symbol = reg["currency"]
+                break
+
         cookie = await get_vinted_cookie(session, domain)
 
         headers = {
@@ -312,7 +410,6 @@ async def fetch_vinted(session):
             "Cookie": cookie
         }
 
-        # Цикл по кожному бренду у списку МП
         for target_brand in target_brands:
             api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={target_brand}&order=newest_first&per_page=15"
 
@@ -339,15 +436,12 @@ async def fetch_vinted(session):
                             item_brand = str(item.get("brand_title", ""))
                             full_text = f"{title} {description} {item_brand}".lower()
 
-                            # 1. Точна перевірка бренду
                             if target_brand.lower() not in full_text:
                                 continue
 
-                            # 2. Перевірка фейків
                             if any(fake_word in full_text for fake_word in FAKE_KEYWORDS):
                                 continue
 
-                            # 3. Парсинг ціни
                             item_price = 0.0
                             raw_price = item.get("price")
                             if isinstance(raw_price, (int, float, str)):
@@ -361,7 +455,6 @@ async def fetch_vinted(session):
                                 try: item_price = float(item.get("price_numeric"))
                                 except ValueError: pass
 
-                            # Фільтрація за максимальної ціною
                             if "Будь-яка" not in user_price_str:
                                 digits = re.findall(r"\d+(?:\.\d+)?", user_price_str.replace(",", "."))
                                 if digits:
@@ -369,7 +462,6 @@ async def fetch_vinted(session):
                                     if item_price > max_p:
                                         continue
 
-                            # 4. Фільтр розмірів
                             size_title = str(item.get("size_title", "")).upper()
                             if user_sizes:
                                 if not any(s.upper() in size_title for s in user_sizes):
