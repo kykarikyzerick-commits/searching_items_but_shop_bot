@@ -14,7 +14,6 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = "8877190549:AAEoSIj_dOL2hi-PpDrfZFJi6h8x40hJnFQ"
 ADMIN_ID = 8138110821
 
-# Зменшено інтервал для прискорення пошуку
 CHECK_INTERVAL = 4
 
 ALLOWED_USERS = [8138110821]
@@ -428,7 +427,7 @@ async def fetch_vinted(session):
         user_sizes = config.get("sizes", [])
         user_price_str = config.get("price", "Будь-яка ціна")
 
-        currency_symbol = "€"
+        currency_symbol = "EUR"
         for reg in DOMAINS.values():
             if reg["code"] == domain:
                 currency_symbol = reg["currency"]
@@ -477,14 +476,30 @@ async def fetch_vinted(session):
                         if any(fake_word in full_text for fake_word in FAKE_KEYWORDS):
                             continue
 
-                        # 3. Фільтр ціни та отримання її значення
-                        try:
-                            item_price = float(item.get("price", 0))
-                        except (ValueError, TypeError):
-                            item_price = 0.0
+                        # 3. Витяг ціни з усіх можливих полів JSON Vinted
+                        item_price = 0.0
+                        raw_price = item.get("price")
+                        
+                        if isinstance(raw_price, (int, float, str)):
+                            try:
+                                item_price = float(raw_price)
+                            except ValueError:
+                                item_price = 0.0
+                        elif isinstance(raw_price, dict):
+                            try:
+                                item_price = float(raw_price.get("amount", 0))
+                            except ValueError:
+                                item_price = 0.0
+                        
+                        if item_price == 0.0 and item.get("price_numeric"):
+                            try:
+                                item_price = float(item.get("price_numeric"))
+                            except ValueError:
+                                pass
 
+                        # Чіткий фільтр макс. ціни (пропускає всі речі з ціною <= max_p)
                         if "Будь-яка" not in user_price_str:
-                            digits = re.findall(r"\d+", user_price_str)
+                            digits = re.findall(r"\d+(?:\.\d+)?", user_price_str.replace(",", "."))
                             if digits:
                                 max_p = float(digits[-1])
                                 if item_price > max_p:
@@ -509,10 +524,12 @@ async def fetch_vinted(session):
                         seller_status = "⚠️ Новий акаунт / Без відгуків" if seller_feedback == 0 else f"✅ Відгуків: {seller_feedback}"
                         seller_url = user_data.get("profile_url", item_url)
 
+                        price_display = f"{item_price:.2f}" if item_price > 0 else "За запитом"
+
                         caption = (
                             f"⚡️ **НОВА ЗНАХІДКА VINTED** ⚡️\n\n"
                             f"🏷 **Назва:** {title}\n"
-                            f"💰 **Ціна:** {item_price} {currency_symbol}\n"
+                            f"💰 **Ціна:** {price_display} {currency_symbol}\n"
                             f"📌 **Бренд:** {item_brand_display}\n"
                             f"📏 **Розмір:** {size_title or 'Не вказано'}\n"
                             f"🛡 **Продавець:** {seller_status}"
