@@ -18,7 +18,7 @@ ADMIN_ID = 8138110821
 
 MONGO_URI = "mongodb+srv://illya:2010@cluster0.p71v9.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 
-CHECK_INTERVAL = 0.5
+CHECK_INTERVAL = 1.0
 ALLOWED_USERS = [8138110821]
 
 MASTER_KEYS = {
@@ -60,6 +60,7 @@ user_states = {}
 seen_items = set()
 last_update_id = 0
 vinted_cookies = {}
+processed_updates = set()
 
 # ==================== РОБОТА З БД ====================
 async def get_user_settings(user_id):
@@ -278,6 +279,13 @@ async def is_valid_brand(session, brand_name, domain="at"):
 
 # ==================== ОБРОБКА ПОВІДОМЛЕНЬ ====================
 async def handle_update(session, update):
+    update_id = update.get("update_id")
+    if update_id in processed_updates:
+        return
+    processed_updates.add(update_id)
+    if len(processed_updates) > 2000:
+        processed_updates.clear()
+
     if "message" in update:
         msg = update["message"]
         chat_id = msg["chat"]["id"]
@@ -298,6 +306,7 @@ async def handle_update(session, update):
         # Адмін-панель
         if chat_id == ADMIN_ID:
             if text == "👑 Адмін-панель":
+                user_states[chat_id] = None
                 await send_telegram_message(session, chat_id, "👑 **Адміністративна панель:**", get_admin_keyboard())
                 return
 
@@ -307,13 +316,13 @@ async def handle_update(session, update):
                 return
 
             if state == "waiting_gen_days":
+                user_states[chat_id] = None
                 if text.isdigit():
                     days = int(text)
                     new_key = await generate_random_key(days)
                     await send_telegram_message(session, chat_id, f"✅ **Ключ успішно створено!**\n\n`{new_key}`\n\nТермін дії: *{days} днів*", get_admin_keyboard())
                 else:
                     await send_telegram_message(session, chat_id, "❌ Будь ласка, введіть тільки число цифрами.", get_admin_keyboard())
-                user_states[chat_id] = None
                 return
 
             if text == "📊 Статистика":
@@ -392,6 +401,7 @@ async def handle_update(session, update):
             return
 
         if state == "waiting_for_key" or text.startswith("VINTED-"):
+            user_states[chat_id] = None
             days_to_add = None
             key_doc = await get_key_data(text)
 
@@ -411,8 +421,6 @@ async def handle_update(session, update):
                     "expires_at": exp_str
                 }
                 await save_key_data(text, updated_key_data)
-
-                user_states[chat_id] = None
                 await send_telegram_message(session, chat_id, f"🎉 **Ключ успішно активовано на {days_to_add} днів!**", await get_main_keyboard(chat_id))
             else:
                 await send_telegram_message(session, chat_id, "❌ **Невірний або вже використаний ключ.**", await get_main_keyboard(chat_id))
@@ -639,14 +647,14 @@ async def fetch_vinted(session):
 async def handle_telegram_commands(session):
     global last_update_id
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-    params = {"offset": last_update_id + 1, "timeout": 0}
+    params = {"offset": last_update_id + 1, "timeout": 3}
     try:
-        async with session.get(url, params=params, timeout=2) as resp:
+        async with session.get(url, params=params, timeout=5) as resp:
             data = await resp.json()
             if data.get("ok") and data.get("result"):
                 for update in data["result"]:
                     last_update_id = update["update_id"]
-                    asyncio.create_task(handle_update(session, update))
+                    await handle_update(session, update)
     except Exception:
         pass
 
