@@ -1,3 +1,3 @@
 aiohttp
-aiohttp_cors
-pymongo[srv]
+motor
+dnspython
