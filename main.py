@@ -20,6 +20,7 @@ MONGO_URI = "mongodb+srv://kykarikyzerick_db_user:CVz4czwK06sgQlSP@cluster0.xuox
 
 CHECK_INTERVAL = 1.0
 ALLOWED_USERS = [8138110821]
+EUR_TO_UAH_RATE = 51.0  # Оновлений курс євро
 
 MASTER_KEYS = {
     "VINTED-VIP-2026": 365,
@@ -283,7 +284,8 @@ async def handle_update(session, update):
             return
 
         if text == "🆘 Підтримка / Помилка":
-            support_text = "🆘 **Служба підтримки:**\n\nЯкщо ви знайшли помилку або маєте запитання, звертайтесь сюди: @but_sh0ping"
+            user_states[chat_id] = None
+            support_text = "🆘 **Служба підтримки:**\n\nЯкщо ви знайшли помилку або маєте запитання, напишіть нам: @but_sh0ping"
             await send_telegram_message(session, chat_id, support_text, await get_main_keyboard(chat_id))
             return
 
@@ -398,7 +400,7 @@ async def handle_update(session, update):
             await send_telegram_message(
                 session, 
                 chat_id, 
-                f"✅ **Успішно збережено!**\n\n🏷 Бренд: *{brand_name}*\n💵 Макс. ціна: *{max_price}*", 
+                f"✅ **Успішно збережено!**\n\n🏷 Бренд: *{brand_name}*\n💵 Макс. ціна: *{max_price} EUR*", 
                 await get_main_keyboard(chat_id)
             )
             return
@@ -478,7 +480,7 @@ async def handle_update(session, update):
             formatted_brands = []
             for b in raw_brands:
                 if isinstance(b, dict):
-                    formatted_brands.append(f"{b.get('name')} (до {b.get('max_price')})")
+                    formatted_brands.append(f"{b.get('name')} (до {b.get('max_price')} EUR)")
                 else:
                     formatted_brands.append(str(b))
 
@@ -547,18 +549,22 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
                 data = await resp.json()
                 items = data.get("items", [])
 
+                now_ts = datetime.now().timestamp()
                 brand_words = [w.lower() for w in target_brand.split() if len(w) > 1]
 
                 for item in items:
                     if item.get("promoted") or item.get("is_promoted"):
                         continue
 
-                    item_id = str(item.get("id", ""))
-                    if not item_id:
-                        continue
+                    # Фільтр за часом створення (максимум 15 хвилин тому)
+                    created_at_ts = item.get("created_at_ts")
+                    if created_at_ts:
+                        time_diff_sec = now_ts - float(created_at_ts)
+                        if time_diff_sec > 900:  # 900 секунд = 15 хвилин
+                            continue
 
-                    # Перевіряємо в MongoDB чи цей товар уже відправляли раніше
-                    if await is_item_seen(item_id):
+                    item_id = str(item.get("id", ""))
+                    if not item_id or await is_item_seen(item_id):
                         continue
 
                     title = str(item.get("title", ""))
@@ -573,7 +579,6 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
                         continue
 
                     item_price = 0.0
-                    
                     if "price_numeric" in item and item["price_numeric"] is not None:
                         try: item_price = float(item["price_numeric"])
                         except ValueError: pass
@@ -595,7 +600,6 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
                         if not any(s.upper() in size_title for s in user_sizes):
                             continue
 
-                    # Записуємо ID знахідки у базу даних, щоб не повторювати
                     await mark_item_seen(item_id)
 
                     item_brand_display = item_brand if item_brand else target_brand
@@ -603,12 +607,14 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
                     photo_data = item.get("photo", {})
                     photo_url = photo_data.get("url") if photo_data else None
 
-                    price_display = f"{item_price:.2f}" if item_price > 0 else "За запитом"
+                    # Переведення ціни в EUR та UAH за курсом 51.0
+                    price_uah = item_price * EUR_TO_UAH_RATE
+                    price_display = f"{item_price:.2f} EUR (~{price_uah:.0f} грн)" if item_price > 0 else "За запитом"
 
                     caption = (
                         f"⚡️ **НОВА ЗНАХІДКА VINTED** ⚡️\n\n"
                         f"🏷 **Назва:** {title}\n"
-                        f"💰 **Ціна:** {price_display} {currency_symbol} (Ліміт: {max_price} {currency_symbol})\n"
+                        f"💰 **Ціна:** {price_display}\n"
                         f"📌 **Бренд:** {item_brand_display}\n"
                         f"📏 **Розмір:** {size_title or 'Не вказано'}"
                     )
