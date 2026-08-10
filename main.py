@@ -55,10 +55,10 @@ mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client["vinted_bot_db"]
 keys_collection = db["keys"]
 settings_collection = db["user_settings"]
+seen_items_collection = db["seen_items"]
 
 user_states = {}
-temp_brand_storage = {}  # Тимчасове збереження назви бренду перед введенням ціни
-seen_items = set()
+temp_brand_storage = {}
 last_update_id = 0
 vinted_cookies = {}
 processed_updates = set()
@@ -70,7 +70,7 @@ async def get_user_settings(user_id):
     if not doc:
         doc = {
             "user_id": uid_str,
-            "brands": [], # [{"name": "Stone Island", "max_price": 75.0}]
+            "brands": [],
             "sizes": [],
             "domain": "at",
             "active": False
@@ -84,6 +84,17 @@ async def save_user_settings(user_id, settings):
     await settings_collection.update_one(
         {"user_id": uid_str},
         {"$set": settings},
+        upsert=True
+    )
+
+async def is_item_seen(item_id):
+    doc = await seen_items_collection.find_one({"item_id": str(item_id)})
+    return doc is not None
+
+async def mark_item_seen(item_id):
+    await seen_items_collection.update_one(
+        {"item_id": str(item_id)},
+        {"$set": {"item_id": str(item_id), "added_at": datetime.now()}},
         upsert=True
     )
 
@@ -162,13 +173,14 @@ async def get_main_keyboard(user_id):
     kb = []
     if not await is_user_active(user_id):
         kb.append([{"text": "🔑 Активувати ключ"}, {"text": "🛒 Придбати ключ"}])
+        kb.append([{"text": "🆘 Підтримка / Помилка"}])
         return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
 
     kb.append([{"text": "➕ Додати бренд"}, {"text": "🗑 Очистити бренди"}])
     kb.append([{"text": "📏 Налаштувати розміри"}, {"text": "🌍 Обрати регіон"}])
     kb.append([{"text": "📋 Мої налаштування"}])
     kb.append([{"text": "▶️ Запустити"}, {"text": "⏹ Зупинити"}])
-    kb.append([{"text": "🔑 Активація / Стан ключа"}])
+    kb.append([{"text": "🔑 Активація / Стан ключа"}, {"text": "🆘 Підтримка / Помилка"}])
     if user_id == ADMIN_ID:
         kb.append([{"text": "👑 Адмін-панель"}])
     return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
@@ -270,6 +282,11 @@ async def handle_update(session, update):
             )
             return
 
+        if text == "🆘 Підтримка / Помилка":
+            support_text = "🆘 **Служба підтримки:**\n\nЯкщо ви знайшли помилку або маєте запитання, звертайтесь сюди: @but_sh0ping"
+            await send_telegram_message(session, chat_id, support_text, await get_main_keyboard(chat_id))
+            return
+
         state = user_states.get(chat_id)
 
         # Адмін-панель
@@ -354,7 +371,6 @@ async def handle_update(session, update):
         if state == "waiting_step2_brand_price":
             brand_name = temp_brand_storage.get(chat_id, "")
             
-            # Витягуємо тільки числа з тексту
             price_digits = re.findall(r"\d+(?:\.\d+)?", text.replace(",", "."))
             if not price_digits:
                 await send_telegram_message(session, chat_id, "❌ **Будь ласка, введіть суму тільки цифрами!** (наприклад: `75`)")
@@ -367,7 +383,6 @@ async def handle_update(session, update):
             cfg = await get_user_settings(chat_id)
             brands = cfg.get("brands", [])
 
-            # Оновлюємо або додаємо новий бренд
             updated = False
             for b in brands:
                 if isinstance(b, dict) and b.get("name", "").lower() == brand_name.lower():
@@ -519,7 +534,6 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
         target_brand = str(brand_obj)
         max_price = float("inf")
 
-    # Передаємо max_price напряму в параметр price_to API Vinted для точного відсіювання на рівні сервера
     price_param = f"&price_to={max_price}" if max_price < float("inf") else ""
     api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={target_brand}&order=newest_first&per_page=30{price_param}"
     
@@ -539,8 +553,12 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
                     if item.get("promoted") or item.get("is_promoted"):
                         continue
 
-                    item_id = item.get("id")
-                    if not item_id or item_id in seen_items:
+                    item_id = str(item.get("id", ""))
+                    if not item_id:
+                        continue
+
+                    # Перевіряємо в MongoDB чи цей товар уже відправляли раніше
+                    if await is_item_seen(item_id):
                         continue
 
                     title = str(item.get("title", ""))
@@ -554,15 +572,12 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
                     if any(fake_word in full_text for fake_word in FAKE_KEYWORDS):
                         continue
 
-                    # Блок точної перевірки ціни
                     item_price = 0.0
                     
-                    # 1. Спроба взяти базову ціну з точного поля
                     if "price_numeric" in item and item["price_numeric"] is not None:
                         try: item_price = float(item["price_numeric"])
                         except ValueError: pass
                     
-                    # 2. Якщо немає numeric, перевіряємо звичайне поле price
                     if item_price == 0.0:
                         raw_price = item.get("price")
                         if isinstance(raw_price, (int, float, str)):
@@ -572,7 +587,6 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
                             try: item_price = float(str(raw_price.get("amount", 0)).replace(",", "."))
                             except ValueError: pass
 
-                    # Жорсткий фільтр ціни (суворо відсікає все, що перевищує вказаний ліміт)
                     if item_price > (max_price + 0.01):
                         continue
 
@@ -581,7 +595,8 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
                         if not any(s.upper() in size_title for s in user_sizes):
                             continue
 
-                    seen_items.add(item_id)
+                    # Записуємо ID знахідки у базу даних, щоб не повторювати
+                    await mark_item_seen(item_id)
 
                     item_brand_display = item_brand if item_brand else target_brand
                     item_url = item.get("url", f"https://www.vinted.{domain}")
