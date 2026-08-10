@@ -16,7 +16,6 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = "8877190549:AAEoSIj_dOL2hi-PpDrfZFJi6h8x40hJnFQ"
 ADMIN_ID = 8138110821
 
-# Новий оновлений URI для MongoDB з вашим актуальним паролем і кластером
 MONGO_URI = "mongodb+srv://kykarikyzerick_db_user:CVz4czwK06sgQlSP@cluster0.xuoxdku.mongodb.net/?appName=Cluster0"
 
 CHECK_INTERVAL = 1.0
@@ -70,9 +69,8 @@ async def get_user_settings(user_id):
     if not doc:
         doc = {
             "user_id": uid_str,
-            "brands": [],
+            "brands": [], # Масив об'єктів: [{"name": "Stone Island", "max_price": 75.0}]
             "sizes": [],
-            "price": "Будь-яка ціна",
             "domain": "at",
             "active": False
         }
@@ -165,9 +163,9 @@ async def get_main_keyboard(user_id):
         kb.append([{"text": "🔑 Активувати ключ"}, {"text": "🛒 Придбати ключ"}])
         return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
 
-    kb.append([{"text": "➕ Додати бренд (МП)"}, {"text": "🗑 Очистити бренди"}])
-    kb.append([{"text": "📏 Налаштувати розміри"}, {"text": "💵 Макс. Ціна"}])
-    kb.append([{"text": "🌍 Обрати регіон"}, {"text": "📋 Мої налаштування"}])
+    kb.append([{"text": "➕ Додати бренд з ціною"}, {"text": "🗑 Очистити бренди"}])
+    kb.append([{"text": "📏 Налаштувати розміри"}, {"text": "🌍 Обрати регіон"}])
+    kb.append([{"text": "📋 Мої налаштування"}])
     kb.append([{"text": "▶️ Запустити"}, {"text": "⏹ Зупинити"}])
     kb.append([{"text": "🔑 Активація / Стан ключа"}])
     if user_id == ADMIN_ID:
@@ -245,38 +243,6 @@ async def send_telegram_photo(session, chat_id, photo_url, caption, reply_markup
             return await resp.json()
     except Exception as e:
         logging.error(f"Telegram Photo Error: {e}")
-
-# ==================== ВАЛІДАЦІЯ БРЕНДІВ ====================
-async def is_valid_brand(session, brand_name, domain="at"):
-    if len(brand_name) < 2 or len(brand_name) > 30:
-        return False, "❌ Назва бренду повинна бути від 2 до 30 символів."
-    
-    if re.search(r"http[s]?://|www\.|@|\.com|\.net", brand_name, re.IGNORECASE):
-        return False, "❌ Назва не повинна містити посилання або спецсимволи."
-
-    if not re.match(r"^[a-zA-Z0-9\s\-\&\.\'\+]+$", brand_name):
-        return False, "❌ Введіть коректну назву бренду (букви, цифри, пробіли, дефіси)."
-
-    cookie = await get_vinted_cookie(session, domain)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Cookie": cookie
-    }
-    api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={brand_name}&per_page=5"
-    try:
-        async with session.get(api_url, headers=headers, timeout=4) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                items = data.get("items", [])
-                if not items:
-                    return False, f"❌ Бренд або товари з назвою *'{brand_name}'* не знайдені на Vinted."
-            else:
-                return True, ""
-    except Exception:
-        pass
-
-    return True, ""
 
 # ==================== ОБРОБКА ПОВІДОМЛЕНЬ ====================
 async def handle_update(session, update):
@@ -371,34 +337,46 @@ async def handle_update(session, update):
             await send_telegram_message(session, chat_id, "📏 Оновлено розміри на панелі:", await get_sizes_panel_keyboard(chat_id))
             return
 
-        # Додавання бренду
-        if state == "waiting_add_brand":
+        # Парсинг додавання бренду разом із ціною
+        if state == "waiting_add_brand_price":
             user_states[chat_id] = None
+            
+            # Парсимо ввід (наприклад: Stone Island 75)
+            match = re.search(r"^(.*?)\s+(\d+(?:\.\d+)?)$", text)
+            if not match:
+                await send_telegram_message(
+                    session, 
+                    chat_id, 
+                    "❌ **Невірний формат!**\n\nБудь ласка, вказуйте бренд і макс. ціну через пробіл.\nПриклад: `Stone Island 75` або `Off White 120`", 
+                    await get_main_keyboard(chat_id)
+                )
+                return
+
+            brand_name = match.group(1).strip()
+            max_price = float(match.group(2))
+
             cfg = await get_user_settings(chat_id)
             brands = cfg.get("brands", [])
 
-            if any(b.lower() == text.lower() for b in brands):
-                await send_telegram_message(session, chat_id, "⚠️ Цей бренд вже є у вашому списку!", await get_main_keyboard(chat_id))
-                return
+            # Оновлюємо або додаємо новий бренд
+            updated = False
+            for b in brands:
+                if isinstance(b, dict) and b.get("name", "").lower() == brand_name.lower():
+                    b["max_price"] = max_price
+                    updated = True
+                    break
 
-            domain = cfg.get("domain", "at")
-            is_valid, err_msg = await is_valid_brand(session, text, domain)
-            if not is_valid:
-                await send_telegram_message(session, chat_id, err_msg, await get_main_keyboard(chat_id))
-                return
+            if not updated:
+                brands.append({"name": brand_name, "max_price": max_price})
 
-            brands.append(text)
             cfg["brands"] = brands
             await save_user_settings(chat_id, cfg)
-            await send_telegram_message(session, chat_id, f"✅ Бренд *{text}* успішно додано!", await get_main_keyboard(chat_id))
-            return
-
-        if state == "waiting_custom_price":
-            cfg = await get_user_settings(chat_id)
-            cfg["price"] = text
-            await save_user_settings(chat_id, cfg)
-            await send_telegram_message(session, chat_id, f"✅ Максимальну ціну встановлено: *{text}*", await get_main_keyboard(chat_id))
-            user_states[chat_id] = None
+            await send_telegram_message(
+                session, 
+                chat_id, 
+                f"✅ **Успішно збережено!**\n\n🏷 Бренд: *{brand_name}*\n💵 Макс. ціна: *{max_price}*", 
+                await get_main_keyboard(chat_id)
+            )
             return
 
         if state == "waiting_for_key" or text.startswith("VINTED-"):
@@ -447,9 +425,13 @@ async def handle_update(session, update):
             return
 
         # Команди меню
-        if text == "➕ Додати бренд (МП)":
-            user_states[chat_id] = "waiting_add_brand"
-            await send_telegram_message(session, chat_id, "Введіть назву бренду для додавання в пошук:")
+        if text in ["➕ Додати бренд з ціною", "➕ Додати бренд (МП)"]:
+            user_states[chat_id] = "waiting_add_brand_price"
+            await send_telegram_message(
+                session, 
+                chat_id, 
+                "Напишіть **назву бренду та максимальну ціну** через пробіл.\n\nНаприклад:\n`Stone Island 75`\n`Off White 120`\n`Nike 40`"
+            )
 
         elif text == "🗑 Очистити бренди":
             cfg = await get_user_settings(chat_id)
@@ -469,29 +451,33 @@ async def handle_update(session, update):
         elif text == "🌍 Обрати регіон":
             await send_telegram_message(session, chat_id, "Оберіть країну з панелі нижче:", await get_region_panel_keyboard(chat_id))
 
-        elif text == "💵 Макс. Ціна":
-            user_states[chat_id] = "waiting_custom_price"
-            await send_telegram_message(session, chat_id, "Введіть максимальну ціну цифрами (наприклад: `30`):")
-
         elif text == "📋 Мої налаштування":
             cfg = await get_user_settings(chat_id)
-            brands = ", ".join(cfg.get("brands", [])) or "Не обрано"
+            raw_brands = cfg.get("brands", [])
+            
+            formatted_brands = []
+            for b in raw_brands:
+                if isinstance(b, dict):
+                    formatted_brands.append(f"{b.get('name')} (до {b.get('max_price')})")
+                else:
+                    formatted_brands.append(str(b))
+
+            brands_str = "\n• ".join(formatted_brands) if formatted_brands else "Не обрано"
             sizes = ", ".join(cfg.get("sizes", [])) or "Всі"
-            price = cfg.get("price", "Будь-яка ціна")
             domain = cfg.get("domain", "at").upper()
             status = "🟢 Активний" if cfg.get("active") else "🔴 Зупинений"
             
-            info = f"⚙️ **Налаштування:**\n\n🏷 **Бренди:** {brands}\n📏 **Розміри:** {sizes}\n💵 **Макс. ціна:** {price}\n🌍 **Регіон:** {domain}\n📡 **Статус:** {status}"
+            info = f"⚙️ **Налаштування:**\n\n🏷 **Бренди та ліміти ціни:**\n• {brands_str}\n\n📏 **Розміри:** {sizes}\n🌍 **Регіон:** {domain}\n📡 **Статус:** {status}"
             await send_telegram_message(session, chat_id, info, await get_main_keyboard(chat_id))
 
         elif text == "▶️ Запустити":
             cfg = await get_user_settings(chat_id)
             if not cfg.get("brands"):
-                await send_telegram_message(session, chat_id, "⚠️ Спочатку додайте хоча б один бренд!", await get_main_keyboard(chat_id))
+                await send_telegram_message(session, chat_id, "⚠️ Спочатку додайте хоча б один бренд з ціною!", await get_main_keyboard(chat_id))
                 return
             cfg["active"] = True
             await save_user_settings(chat_id, cfg)
-            await send_telegram_message(session, chat_id, "Пошук запущено", await get_main_keyboard(chat_id))
+            await send_telegram_message(session, chat_id, "🚀 Пошук запущено!", await get_main_keyboard(chat_id))
 
         elif text == "⏹ Зупинити":
             cfg = await get_user_settings(chat_id)
@@ -520,8 +506,16 @@ async def get_vinted_cookie(session, domain):
     except Exception:
         return ""
 
-async def process_brand_search(session, user_id, target_brand, domain, user_sizes, user_price_str, currency_symbol, headers):
-    api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={target_brand}&order=newest_first&per_page=15"
+async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, currency_symbol, headers):
+    if isinstance(brand_obj, dict):
+        target_brand = brand_obj.get("name", "")
+        max_price = brand_obj.get("max_price", float("inf"))
+    else:
+        target_brand = str(brand_obj)
+        max_price = float("inf")
+
+    # Збільшено кількість товарів у запиті (per_page=30), щоб не пропускати нічого
+    api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={target_brand}&order=newest_first&per_page=30"
     try:
         async with session.get(api_url, headers=headers, timeout=5) as resp:
             if resp.status in (401, 403, 429):
@@ -531,6 +525,8 @@ async def process_brand_search(session, user_id, target_brand, domain, user_size
             if resp.status == 200:
                 data = await resp.json()
                 items = data.get("items", [])
+
+                brand_words = [w.lower() for w in target_brand.split() if len(w) > 1]
 
                 for item in items:
                     if item.get("promoted") or item.get("is_promoted"):
@@ -545,7 +541,8 @@ async def process_brand_search(session, user_id, target_brand, domain, user_size
                     item_brand = str(item.get("brand_title", ""))
                     full_text = f"{title} {description} {item_brand}".lower()
 
-                    if target_brand.lower() not in full_text:
+                    # Покращена гнучка перевірка входження бренду
+                    if not all(word in full_text for word in brand_words):
                         continue
 
                     if any(fake_word in full_text for fake_word in FAKE_KEYWORDS):
@@ -564,12 +561,9 @@ async def process_brand_search(session, user_id, target_brand, domain, user_size
                         try: item_price = float(item.get("price_numeric"))
                         except ValueError: pass
 
-                    if "Будь-яка" not in user_price_str:
-                        digits = re.findall(r"\d+(?:\.\d+)?", user_price_str.replace(",", "."))
-                        if digits:
-                            max_p = float(digits[-1])
-                            if item_price > max_p:
-                                continue
+                    # Фільтр ціни для конкретного бренду
+                    if item_price > max_price:
+                        continue
 
                     size_title = str(item.get("size_title", "")).upper()
                     if user_sizes:
@@ -588,7 +582,7 @@ async def process_brand_search(session, user_id, target_brand, domain, user_size
                     caption = (
                         f"⚡️ **НОВА ЗНАХІДКА VINTED** ⚡️\n\n"
                         f"🏷 **Назва:** {title}\n"
-                        f"💰 **Ціна:** {price_display} {currency_symbol}\n"
+                        f"💰 **Ціна:** {price_display} {currency_symbol} (Ліміт: {max_price} {currency_symbol})\n"
                         f"📌 **Бренд:** {item_brand_display}\n"
                         f"📏 **Розмір:** {size_title or 'Не вказано'}"
                     )
@@ -616,7 +610,6 @@ async def fetch_vinted(session):
             continue
 
         user_sizes = config.get("sizes", [])
-        user_price_str = str(config.get("price", "Будь-яка ціна"))
 
         currency_symbol = "EUR"
         for reg in DOMAINS.values():
@@ -634,10 +627,10 @@ async def fetch_vinted(session):
             "Cookie": cookie
         }
 
-        for target_brand in target_brands:
+        for brand_obj in target_brands:
             tasks.append(
                 process_brand_search(
-                    session, user_id, target_brand, domain, user_sizes, user_price_str, currency_symbol, headers
+                    session, user_id, brand_obj, domain, user_sizes, currency_symbol, headers
                 )
             )
 
