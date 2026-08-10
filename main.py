@@ -57,6 +57,7 @@ keys_collection = db["keys"]
 settings_collection = db["user_settings"]
 
 user_states = {}
+temp_brand_storage = {}  # Тимчасове збереження назви бренду перед введенням ціни
 seen_items = set()
 last_update_id = 0
 vinted_cookies = {}
@@ -69,7 +70,7 @@ async def get_user_settings(user_id):
     if not doc:
         doc = {
             "user_id": uid_str,
-            "brands": [], # Масив об'єктів: [{"name": "Stone Island", "max_price": 75.0}]
+            "brands": [], # [{"name": "Stone Island", "max_price": 75.0}]
             "sizes": [],
             "domain": "at",
             "active": False
@@ -163,7 +164,7 @@ async def get_main_keyboard(user_id):
         kb.append([{"text": "🔑 Активувати ключ"}, {"text": "🛒 Придбати ключ"}])
         return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
 
-    kb.append([{"text": "➕ Додати бренд з ціною"}, {"text": "🗑 Очистити бренди"}])
+    kb.append([{"text": "➕ Додати бренд"}, {"text": "🗑 Очистити бренди"}])
     kb.append([{"text": "📏 Налаштувати розміри"}, {"text": "🌍 Обрати регіон"}])
     kb.append([{"text": "📋 Мої налаштування"}])
     kb.append([{"text": "▶️ Запустити"}, {"text": "⏹ Зупинити"}])
@@ -260,6 +261,7 @@ async def handle_update(session, update):
 
         if text in ["/start", "меню", "Start", "start", "🔙 Головне меню"]:
             user_states[chat_id] = None
+            temp_brand_storage.pop(chat_id, None)
             await send_telegram_message(
                 session, 
                 chat_id, 
@@ -337,23 +339,30 @@ async def handle_update(session, update):
             await send_telegram_message(session, chat_id, "📏 Оновлено розміри на панелі:", await get_sizes_panel_keyboard(chat_id))
             return
 
-        # Парсинг додавання бренду разом із ціною
-        if state == "waiting_add_brand_price":
-            user_states[chat_id] = None
+        # КРОК 1: Введення назви бренду
+        if state == "waiting_step1_brand_name":
+            temp_brand_storage[chat_id] = text
+            user_states[chat_id] = "waiting_step2_brand_price"
+            await send_telegram_message(
+                session, 
+                chat_id, 
+                f"🏷 Бренд: *{text}*\n\nТепер напишіть **максимальну ціну** для цього бренду цифрами (наприклад: `75` або `120`):"
+            )
+            return
+
+        # КРОК 2: Введення ціни для бренду
+        if state == "waiting_step2_brand_price":
+            brand_name = temp_brand_storage.get(chat_id, "")
             
-            # Парсимо ввід (наприклад: Stone Island 75)
-            match = re.search(r"^(.*?)\s+(\d+(?:\.\d+)?)$", text)
-            if not match:
-                await send_telegram_message(
-                    session, 
-                    chat_id, 
-                    "❌ **Невірний формат!**\n\nБудь ласка, вказуйте бренд і макс. ціну через пробіл.\nПриклад: `Stone Island 75` або `Off White 120`", 
-                    await get_main_keyboard(chat_id)
-                )
+            # Витягуємо тільки числа з тексту
+            price_digits = re.findall(r"\d+(?:\.\d+)?", text.replace(",", "."))
+            if not price_digits:
+                await send_telegram_message(session, chat_id, "❌ **Будь ласка, введіть суму тільки цифрами!** (наприклад: `75`)")
                 return
 
-            brand_name = match.group(1).strip()
-            max_price = float(match.group(2))
+            max_price = float(price_digits[0])
+            user_states[chat_id] = None
+            temp_brand_storage.pop(chat_id, None)
 
             cfg = await get_user_settings(chat_id)
             brands = cfg.get("brands", [])
@@ -425,13 +434,9 @@ async def handle_update(session, update):
             return
 
         # Команди меню
-        if text in ["➕ Додати бренд з ціною", "➕ Додати бренд (МП)"]:
-            user_states[chat_id] = "waiting_add_brand_price"
-            await send_telegram_message(
-                session, 
-                chat_id, 
-                "Напишіть **назву бренду та максимальну ціну** через пробіл.\n\nНаприклад:\n`Stone Island 75`\n`Off White 120`\n`Nike 40`"
-            )
+        if text in ["➕ Додати бренд", "➕ Додати бренд з ціною", "➕ Додати бренд (МП)"]:
+            user_states[chat_id] = "waiting_step1_brand_name"
+            await send_telegram_message(session, chat_id, "Напишіть **назву бренду** (наприклад: `Stone Island` або `Off White`):")
 
         elif text == "🗑 Очистити бренди":
             cfg = await get_user_settings(chat_id)
@@ -509,13 +514,15 @@ async def get_vinted_cookie(session, domain):
 async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, currency_symbol, headers):
     if isinstance(brand_obj, dict):
         target_brand = brand_obj.get("name", "")
-        max_price = brand_obj.get("max_price", float("inf"))
+        max_price = float(brand_obj.get("max_price", float("inf")))
     else:
         target_brand = str(brand_obj)
         max_price = float("inf")
 
-    # Збільшено кількість товарів у запиті (per_page=30), щоб не пропускати нічого
-    api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={target_brand}&order=newest_first&per_page=30"
+    # Передаємо max_price напряму в параметр price_to API Vinted для точного відсіювання на рівні сервера
+    price_param = f"&price_to={max_price}" if max_price < float("inf") else ""
+    api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={target_brand}&order=newest_first&per_page=30{price_param}"
+    
     try:
         async with session.get(api_url, headers=headers, timeout=5) as resp:
             if resp.status in (401, 403, 429):
@@ -541,28 +548,32 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
                     item_brand = str(item.get("brand_title", ""))
                     full_text = f"{title} {description} {item_brand}".lower()
 
-                    # Покращена гнучка перевірка входження бренду
                     if not all(word in full_text for word in brand_words):
                         continue
 
                     if any(fake_word in full_text for fake_word in FAKE_KEYWORDS):
                         continue
 
+                    # Блок точної перевірки ціни
                     item_price = 0.0
-                    raw_price = item.get("price")
-                    if isinstance(raw_price, (int, float, str)):
-                        try: item_price = float(raw_price)
+                    
+                    # 1. Спроба взяти базову ціну з точного поля
+                    if "price_numeric" in item and item["price_numeric"] is not None:
+                        try: item_price = float(item["price_numeric"])
                         except ValueError: pass
-                    elif isinstance(raw_price, dict):
-                        try: item_price = float(raw_price.get("amount", 0))
-                        except ValueError: pass
+                    
+                    # 2. Якщо немає numeric, перевіряємо звичайне поле price
+                    if item_price == 0.0:
+                        raw_price = item.get("price")
+                        if isinstance(raw_price, (int, float, str)):
+                            try: item_price = float(str(raw_price).replace(",", "."))
+                            except ValueError: pass
+                        elif isinstance(raw_price, dict):
+                            try: item_price = float(str(raw_price.get("amount", 0)).replace(",", "."))
+                            except ValueError: pass
 
-                    if item_price == 0.0 and item.get("price_numeric"):
-                        try: item_price = float(item.get("price_numeric"))
-                        except ValueError: pass
-
-                    # Фільтр ціни для конкретного бренду
-                    if item_price > max_price:
+                    # Жорсткий фільтр ціни (суворо відсікає все, що перевищує вказаний ліміт)
+                    if item_price > (max_price + 0.01):
                         continue
 
                     size_title = str(item.get("size_title", "")).upper()
