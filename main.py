@@ -5,6 +5,7 @@ import random
 import re
 import string
 import json
+import time
 from datetime import datetime, timedelta
 import aiohttp
 from aiohttp import web
@@ -18,9 +19,10 @@ ADMIN_ID = 8138110821
 
 MONGO_URI = "mongodb+srv://kykarikyzerick_db_user:CVz4czwK06sgQlSP@cluster0.xuoxdku.mongodb.net/?appName=Cluster0"
 
-CHECK_INTERVAL = 0.2
+CHECK_INTERVAL = 0.1  # Прискорено інтервал перевірки
 ALLOWED_USERS = [8138110821]
 EUR_TO_UAH_RATE = 51.0
+MAX_ITEM_AGE_MINUTES = 30  # Жорсткий ліміт: тільки речі, викладені не пізніше 30 хв тому
 
 MASTER_KEYS = {
     "VINTED-VIP-2026": 365,
@@ -295,17 +297,14 @@ async def handle_update(session, update):
         chat_id = msg["chat"]["id"]
         text = msg.get("text", "").strip()
 
-        # Обробка фотографій
         if "photo" in msg:
             if not await is_user_active(chat_id):
                 await send_telegram_message(session, chat_id, "🔒 **Доступ обмежено!** Натисніть кнопку активації ключа.")
                 return
 
             await send_telegram_message(session, chat_id, "🔍 **Аналізую зображення...** Шукаю схожі речі на Vinted.")
-            
-            # Базовий розпізнавач брендів/типів за підписом або дефолтний аналіз
             caption = msg.get("caption", "").strip()
-            search_query = caption if caption else "Stone Island"  # Резервний запит для пошуку схожих моделей
+            search_query = caption if caption else "Stone Island"
             
             cfg = await get_user_settings(chat_id)
             brands = cfg.get("brands", [])
@@ -334,7 +333,6 @@ async def handle_update(session, update):
 
         state = user_states.get(chat_id)
 
-        # Стан товару
         if "🌐 Усі речі" in text or "✨ Тільки Нові" in text or "🔄 Тільки Б/У" in text:
             cfg = await get_user_settings(chat_id)
             if "Тільки Нові" in text:
@@ -351,7 +349,6 @@ async def handle_update(session, update):
             await send_telegram_message(session, chat_id, res_text, await get_condition_panel_keyboard(chat_id))
             return
 
-        # Адмін-панель
         if chat_id == ADMIN_ID:
             if text == "👑 Адмін-панель":
                 user_states[chat_id] = None
@@ -395,7 +392,6 @@ async def handle_update(session, update):
                     await send_telegram_message(session, chat_id, msg_list, get_admin_keyboard())
                 return
 
-        # Регіон
         clean_reg_text = text.replace("✅ ", "")
         if clean_reg_text in DOMAINS:
             cfg = await get_user_settings(chat_id)
@@ -404,7 +400,6 @@ async def handle_update(session, update):
             await send_telegram_message(session, chat_id, f"✅ Регіон змінено на: *{clean_reg_text}*", await get_region_panel_keyboard(chat_id))
             return
 
-        # Розміри
         clean_size = text.replace("✅ ", "")
         if clean_size in SIZES_LIST:
             cfg = await get_user_settings(chat_id)
@@ -418,7 +413,6 @@ async def handle_update(session, update):
             await send_telegram_message(session, chat_id, "📏 Оновлено розміри на панелі:", await get_sizes_panel_keyboard(chat_id))
             return
 
-        # Бренд
         if state == "waiting_step1_brand_name":
             temp_brand_storage[chat_id] = text
             user_states[chat_id] = "waiting_step2_brand_price"
@@ -507,7 +501,6 @@ async def handle_update(session, update):
             await send_telegram_message(session, chat_id, "🔒 **Доступ обмежено!** Натисніть кнопку активації ключа.", await get_main_keyboard(chat_id))
             return
 
-        # Меню
         if text in ["➕ Додати бренд", "➕ Додати бренд з ціною", "➕ Додати бренд (МП)"]:
             user_states[chat_id] = "waiting_step1_brand_name"
             await send_telegram_message(session, chat_id, "Напишіть **назву бренду** (наприклад: `Stone Island` або `Off White`):")
@@ -623,9 +616,27 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
                 items = data.get("items", [])
                 brand_words = [w.lower() for w in target_brand.split() if len(w) > 1] if target_brand else []
 
+                now_ts = int(time.time())
+                max_age_sec = MAX_ITEM_AGE_MINUTES * 60
+
                 for item in items:
                     if item.get("promoted") or item.get("is_promoted"):
                         continue
+
+                    # --- СУВОРИЙ ФІЛЬТР ЗА ЧАСОМ ПУБЛІКАЦІЇ ---
+                    created_ts = item.get("photo", {}).get("high_resolution", {}).get("timestamp") or item.get("created_at_ts")
+                    if not created_ts and "created_at" in item:
+                        try:
+                            dt = datetime.fromisoformat(str(item["created_at"]).replace("Z", "+00:00"))
+                            created_ts = int(dt.timestamp())
+                        except Exception:
+                            pass
+
+                    if created_ts:
+                        item_age = now_ts - int(created_ts)
+                        # Якщо річ викладена раніше ніж 30 хвилин тому — пропускаємо
+                        if item_age > max_age_sec:
+                            continue
 
                     item_id = str(item.get("id", ""))
                     if not item_id or await is_item_seen(item_id):
