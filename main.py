@@ -18,7 +18,7 @@ ADMIN_ID = 8138110821
 
 MONGO_URI = "mongodb+srv://kykarikyzerick_db_user:CVz4czwK06sgQlSP@cluster0.xuoxdku.mongodb.net/?appName=Cluster0"
 
-CHECK_INTERVAL = 0.2  # Максимальне прискорення перевірки
+CHECK_INTERVAL = 0.2
 ALLOWED_USERS = [8138110821]
 EUR_TO_UAH_RATE = 51.0
 
@@ -33,19 +33,15 @@ SIZES_LIST = [
     "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46"
 ]
 
-# РОЗШИРЕНІ ТЕГИ ДЛЯ ВИЯВЛЕННЯ ПІДРОБОК КІЛЬКОМА МОВАМИ
+# ID станів Vinted API: 6 — Новий з етикеткою, 1 — Новий без етикетки
+NEW_STATUS_IDS = ["6", "1"]
+
 FAKE_KEYWORDS = [
-    # ENG
     "fake", "replica", "rep", "1:1", "1v1", "copy", "counterfeit", "knockoff", "bootleg", "not original", "ua pair", "cloned",
-    # FRA
     "faux", "fausse", "réplique", "replique", "copie", "contrefaçon", "imitation", "non authentique",
-    # DEU
     "gefälscht", "kopia", "fälschung", "plagiat", "unecht",
-    # POL / CZE
     "fałszywy", "replika", "podróbka", "podrobka", "padělek",
-    # ITA / ESP
     "falso", "imittazione", "réplica", "copia no original",
-    # UKR / RUS
     "1в1", "репліка", "реплика", "копія", "копия", "фейк", "паль", "люкс", "не оригінал", "не оригинал"
 ]
 
@@ -73,7 +69,6 @@ last_update_id = 0
 vinted_cookies = {}
 processed_updates = set()
 
-# Indexing для швидшої роботи MongoDB
 async def init_db_indexes():
     await seen_items_collection.create_index("item_id", unique=True)
 
@@ -87,6 +82,7 @@ async def get_user_settings(user_id):
             "brands": [],
             "sizes": [],
             "domain": "at",
+            "condition": "all",  # "all", "new", "used"
             "active": False
         }
         await settings_collection.insert_one(doc)
@@ -182,7 +178,7 @@ async def get_key_remaining_time(user_id):
 
     return None
 
-# ==================== КЛАВІАТУРИ НИЖНЬОЇ ПАНЕЛІ ====================
+# ==================== КЛАВІАТУРИ ====================
 async def get_main_keyboard(user_id):
     kb = []
     if not await is_user_active(user_id):
@@ -192,11 +188,26 @@ async def get_main_keyboard(user_id):
 
     kb.append([{"text": "➕ Додати бренд"}, {"text": "🗑 Очистити бренди"}])
     kb.append([{"text": "📏 Налаштувати розміри"}, {"text": "🌍 Обрати регіон"}])
-    kb.append([{"text": "📋 Мої налаштування"}])
+    kb.append([{"text": "🏷 Стан товару"}, {"text": "📋 Мої налаштування"}])
     kb.append([{"text": "▶️ Запустити"}, {"text": "⏹ Зупинити"}])
     kb.append([{"text": "🔑 Активація / Стан ключа"}, {"text": "🆘 Підтримка / Помилка"}])
     if user_id == ADMIN_ID:
         kb.append([{"text": "👑 Адмін-панель"}])
+    return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
+
+async def get_condition_panel_keyboard(user_id):
+    cfg = await get_user_settings(user_id)
+    cond = cfg.get("condition", "all")
+    
+    p_all = "✅ " if cond == "all" else ""
+    p_new = "✅ " if cond == "new" else ""
+    p_used = "✅ " if cond == "used" else ""
+
+    kb = [
+        [{"text": f"{p_all}🌐 Усі речі (Б/У + Нові)"}],
+        [{"text": f"{p_new}✨ Тільки Нові"}, {"text": f"{p_used}🔄 Тільки Б/У"}],
+        [{"text": "🔙 Головне меню"}]
+    ]
     return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
 
 def get_admin_keyboard():
@@ -285,7 +296,6 @@ async def handle_update(session, update):
         chat_id = msg["chat"]["id"]
         text = msg.get("text", "").strip()
 
-        # Фікс підтримки
         if text == "🆘 Підтримка / Помилка":
             user_states[chat_id] = None
             support_text = "🆘 **Служба підтримки:**\n\nЯкщо ви знайшли помилку або маєте запитання, напишіть адміністратору: @but_sh0ping"
@@ -304,6 +314,23 @@ async def handle_update(session, update):
             return
 
         state = user_states.get(chat_id)
+
+        # Фіктрування станів товару
+        if "🌐 Усі речі" in text or "✨ Тільки Нові" in text or "🔄 Тільки Б/У" in text:
+            cfg = await get_user_settings(chat_id)
+            if "Тільки Нові" in text:
+                cfg["condition"] = "new"
+                res_text = "✨ Встановлено фільтр: **Тільки нові речі**"
+            elif "Тільки Б/У" in text:
+                cfg["condition"] = "used"
+                res_text = "🔄 Встановлено фільтр: **Тільки Б/У речі**"
+            else:
+                cfg["condition"] = "all"
+                res_text = "🌐 Встановлено фільтр: **Усі речі (Б/У + Нові)**"
+
+            await save_user_settings(chat_id, cfg)
+            await send_telegram_message(session, chat_id, res_text, await get_condition_panel_keyboard(chat_id))
+            return
 
         # Адмін-панель
         if chat_id == ADMIN_ID:
@@ -349,7 +376,7 @@ async def handle_update(session, update):
                     await send_telegram_message(session, chat_id, msg_list, get_admin_keyboard())
                 return
 
-        # Перевірка регіону
+        # Регіон
         clean_reg_text = text.replace("✅ ", "")
         if clean_reg_text in DOMAINS:
             cfg = await get_user_settings(chat_id)
@@ -358,7 +385,7 @@ async def handle_update(session, update):
             await send_telegram_message(session, chat_id, f"✅ Регіон змінено на: *{clean_reg_text}*", await get_region_panel_keyboard(chat_id))
             return
 
-        # Обробка розмірів
+        # Розміри
         clean_size = text.replace("✅ ", "")
         if clean_size in SIZES_LIST:
             cfg = await get_user_settings(chat_id)
@@ -372,7 +399,7 @@ async def handle_update(session, update):
             await send_telegram_message(session, chat_id, "📏 Оновлено розміри на панелі:", await get_sizes_panel_keyboard(chat_id))
             return
 
-        # Введення бренду
+        # Бренд
         if state == "waiting_step1_brand_name":
             temp_brand_storage[chat_id] = text
             user_states[chat_id] = "waiting_step2_brand_price"
@@ -466,11 +493,14 @@ async def handle_update(session, update):
             user_states[chat_id] = "waiting_step1_brand_name"
             await send_telegram_message(session, chat_id, "Напишіть **назву бренду** (наприклад: `Stone Island` або `Off White`):")
 
+        elif text == "🏷 Стан товару":
+            await send_telegram_message(session, chat_id, "Оберіть стан товарів для пошуку:", await get_condition_panel_keyboard(chat_id))
+
         elif text == "🗑 Очистити бренди":
             cfg = await get_user_settings(chat_id)
             cfg["brands"] = []
             await save_user_settings(chat_id, cfg)
-            await send_telegram_message(session, chat_id, "🗑 Список брендів очищено. **Бот тепер надсилатиме ВСІ абсолютно нові речі!**", await get_main_keyboard(chat_id))
+            await send_telegram_message(session, chat_id, "🗑 Список брендів очищено. **Бот тепер надсилатиме ВСІ речі!**", await get_main_keyboard(chat_id))
 
         elif text == "📏 Налаштувати розміри":
             await send_telegram_message(session, chat_id, "Оберіть розміри на нижній панелі:", await get_sizes_panel_keyboard(chat_id))
@@ -500,14 +530,17 @@ async def handle_update(session, update):
             domain = cfg.get("domain", "at").upper()
             status = "🟢 Активний" if cfg.get("active") else "🔴 Зупинений"
             
-            info = f"⚙️ **Налаштування:**\n\n🏷 **Бренди та ліміти:**\n• {brands_str}\n\n📏 **Розміри:** {sizes}\n🌍 **Регіон:** {domain}\n📡 **Статус:** {status}"
+            cond_map = {"all": "Усі (Б/У + Нові)", "new": "✨ Тільки Нові", "used": "🔄 Тільки Б/У"}
+            cond_str = cond_map.get(cfg.get("condition", "all"), "Усі")
+
+            info = f"⚙️ **Налаштування:**\n\n🏷 **Бренди та ліміти:**\n• {brands_str}\n\n📏 **Розміри:** {sizes}\n🏷 **Стан:** {cond_str}\n🌍 **Регіон:** {domain}\n📡 **Статус:** {status}"
             await send_telegram_message(session, chat_id, info, await get_main_keyboard(chat_id))
 
         elif text == "▶️ Запустити":
             cfg = await get_user_settings(chat_id)
             cfg["active"] = True
             await save_user_settings(chat_id, cfg)
-            await send_telegram_message(session, chat_id, "🚀 Пошук найновіших речей запущено!", await get_main_keyboard(chat_id))
+            await send_telegram_message(session, chat_id, "🚀 Пошук речей запущено!", await get_main_keyboard(chat_id))
 
         elif text == "⏹ Зупинити":
             cfg = await get_user_settings(chat_id)
@@ -536,7 +569,13 @@ async def get_vinted_cookie(session, domain):
     except Exception:
         return ""
 
-async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, headers):
+async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, condition, headers):
+    status_param = ""
+    if condition == "new":
+        status_param = "&status_ids[]=6&status_ids[]=1"
+    elif condition == "used":
+        status_param = "&status_ids[]=2&status_ids[]=3&status_ids[]=5"
+
     if brand_obj:
         if isinstance(brand_obj, dict):
             target_brand = brand_obj.get("name", "")
@@ -545,12 +584,11 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
             target_brand = str(brand_obj)
             max_price = float("inf")
         price_param = f"&price_to={max_price}" if max_price < float("inf") else ""
-        api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={target_brand}&order=newest_first&per_page=20{price_param}"
+        api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={target_brand}&order=newest_first&per_page=20{price_param}{status_param}"
     else:
-        # ЯКЩО БРЕНД НЕ ВКАЗАНИЙ — ШУКАЄМО ВЗАГАЛІ ВСІ НАЙНОВІШІ РЕЧІ
         target_brand = ""
         max_price = float("inf")
-        api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?order=newest_first&per_page=30"
+        api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?order=newest_first&per_page=30{status_param}"
 
     try:
         async with session.get(api_url, headers=headers, timeout=3) as resp:
@@ -582,6 +620,13 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
                     if any(fake_word in full_text for fake_word in FAKE_KEYWORDS):
                         continue
 
+                    # Фільтрація по стану вручну на випадок ігнорування параметрів API
+                    status_id = str(item.get("status_id", ""))
+                    if condition == "new" and status_id and status_id not in NEW_STATUS_IDS:
+                        continue
+                    elif condition == "used" and status_id in NEW_STATUS_IDS:
+                        continue
+
                     item_price = 0.0
                     if "price_numeric" in item and item["price_numeric"] is not None:
                         try: item_price = float(item["price_numeric"])
@@ -611,6 +656,8 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
                     photo_data = item.get("photo", {})
                     photo_url = photo_data.get("url") if photo_data else None
 
+                    status_title = item.get("status", "Не вказано")
+
                     price_uah = item_price * EUR_TO_UAH_RATE
                     price_display = f"{item_price:.2f} EUR (~{price_uah:.0f} грн)" if item_price > 0 else "За запитом"
 
@@ -619,7 +666,8 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
                         f"🏷 **Назва:** {title}\n"
                         f"💰 **Ціна:** {price_display}\n"
                         f"📌 **Бренд:** {item_brand_display}\n"
-                        f"📏 **Розмір:** {size_title or 'Не вказано'}"
+                        f"📏 **Розмір:** {size_title or 'Не вказано'}\n"
+                        f"✨ **Стан:** {status_title}"
                     )
 
                     keyboard = get_item_keyboard(item_url)
@@ -642,6 +690,7 @@ async def fetch_vinted(session):
         domain = config.get("domain", "at")
         target_brands = config.get("brands", [])
         user_sizes = config.get("sizes", [])
+        condition = config.get("condition", "all")
 
         cookie = await get_vinted_cookie(session, domain)
 
@@ -655,10 +704,9 @@ async def fetch_vinted(session):
 
         if target_brands:
             for brand_obj in target_brands:
-                tasks.append(process_brand_search(session, user_id, brand_obj, domain, user_sizes, headers))
+                tasks.append(process_brand_search(session, user_id, brand_obj, domain, user_sizes, condition, headers))
         else:
-            # Шукаємо абсолютно все
-            tasks.append(process_brand_search(session, user_id, None, domain, user_sizes, headers))
+            tasks.append(process_brand_search(session, user_id, None, domain, user_sizes, condition, headers))
 
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
