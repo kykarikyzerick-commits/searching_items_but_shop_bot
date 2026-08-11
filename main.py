@@ -19,10 +19,10 @@ ADMIN_ID = 8138110821
 
 MONGO_URI = "mongodb+srv://kykarikyzerick_db_user:CVz4czwK06sgQlSP@cluster0.xuoxdku.mongodb.net/?appName=Cluster0"
 
-CHECK_INTERVAL = 0.1  # Прискорено інтервал перевірки
+CHECK_INTERVAL = 0.1
 ALLOWED_USERS = [8138110821]
 EUR_TO_UAH_RATE = 51.0
-MAX_ITEM_AGE_MINUTES = 30  # Жорсткий ліміт: тільки речі, викладені не пізніше 30 хв тому
+MAX_ITEM_AGE_MINUTES = 30  # Жорсткий фільтр на 30 хвилин
 
 MASTER_KEYS = {
     "VINTED-VIP-2026": 365,
@@ -186,7 +186,7 @@ async def get_main_keyboard(user_id):
         kb.append([{"text": "🔑 Активувати ключ"}, {"text": "🛒 Придбати ключ"}])
         return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
 
-    kb.append([{"text": "➕ Додати бренд"}, {"text": "🖼 Пошук за фото"}])
+    kb.append([{"text": "➕ Додати / Редагувати бренд"}, {"text": "🖼 Пошук за фото"}])
     kb.append([{"text": "📏 Налаштувати розміри"}, {"text": "🌍 Обрати регіон"}])
     kb.append([{"text": "🏷 Стан товару"}, {"text": "🗑 Очистити бренди"}])
     kb.append([{"text": "📋 Мої налаштування"}])
@@ -194,6 +194,28 @@ async def get_main_keyboard(user_id):
     kb.append([{"text": "🔑 Активація / Стан ключа"}])
     if user_id == ADMIN_ID:
         kb.append([{"text": "👑 Адмін-панель"}])
+    return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
+
+async def get_brand_management_keyboard(user_id):
+    cfg = await get_user_settings(user_id)
+    brands = cfg.get("brands", [])
+    
+    kb = [[{"text": "🆕 Створити новий бренд"}]]
+    if brands:
+        kb.append([{"text": "💰 Змінити ціну існуючого бренду"}])
+        kb.append([{"text": "✏️ Змінити назву бренду (залишити ціну)"}])
+    kb.append([{"text": "🔙 Головне меню"}])
+    return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
+
+async def get_user_brands_keyboard(user_id):
+    cfg = await get_user_settings(user_id)
+    brands = cfg.get("brands", [])
+    kb = []
+    for b in brands:
+        name = b.get("name") if isinstance(b, dict) else str(b)
+        price = b.get("max_price", "∞") if isinstance(b, dict) else "∞"
+        kb.append([{"text": f"{name} ({price} EUR)"}])
+    kb.append([{"text": "🔙 Головне меню"}])
     return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
 
 async def get_condition_panel_keyboard(user_id):
@@ -413,6 +435,98 @@ async def handle_update(session, update):
             await send_telegram_message(session, chat_id, "📏 Оновлено розміри на панелі:", await get_sizes_panel_keyboard(chat_id))
             return
 
+        # --- КЕРУВАННЯ БРЕНДАМИ ТА ЦІНАМИ ---
+        if text in ["➕ Додати бренд", "➕ Додати / Редагувати бренд"]:
+            await send_telegram_message(session, chat_id, "⚙️ **Оберіть потрібну дію:**", await get_brand_management_keyboard(chat_id))
+            return
+
+        if text == "🆕 Створити новий бренд":
+            user_states[chat_id] = "waiting_step1_brand_name"
+            await send_telegram_message(session, chat_id, "Напишіть **назву нового бренду** (наприклад: `Nike`):")
+            return
+
+        if text == "💰 Змінити ціну існуючого бренду":
+            user_states[chat_id] = "select_brand_for_price_change"
+            await send_telegram_message(session, chat_id, "Оберіть бренд, для якого бажаєте змінити ціну:", await get_user_brands_keyboard(chat_id))
+            return
+
+        if text == "✏️ Змінити назву бренду (залишити ціну)":
+            user_states[chat_id] = "select_brand_for_name_change"
+            await send_telegram_message(session, chat_id, "Оберіть бренд, який хочете перейменувати:", await get_user_brands_keyboard(chat_id))
+            return
+
+        if state == "select_brand_for_price_change":
+            raw_selected = text.split(" (")[0]
+            cfg = await get_user_settings(chat_id)
+            found = False
+            for b in cfg.get("brands", []):
+                b_name = b.get("name") if isinstance(b, dict) else str(b)
+                if b_name.lower() == raw_selected.lower():
+                    temp_brand_storage[chat_id] = b_name
+                    found = True
+                    break
+            if found:
+                user_states[chat_id] = "waiting_new_price_only"
+                await send_telegram_message(session, chat_id, f"Введіть **нову максимальну ціну** для бренду *{temp_brand_storage[chat_id]}* в EUR (наприклад: `50`):")
+            else:
+                await send_telegram_message(session, chat_id, "❌ Бренд не знайдено в списку.", await get_main_keyboard(chat_id))
+            return
+
+        if state == "waiting_new_price_only":
+            brand_name = temp_brand_storage.get(chat_id, "")
+            price_digits = re.findall(r"\d+(?:\.\d+)?", text.replace(",", "."))
+            if not price_digits:
+                await send_telegram_message(session, chat_id, "❌ **Введіть суму цифрами!** (наприклад: `50`) ")
+                return
+
+            new_price = float(price_digits[0])
+            user_states[chat_id] = None
+            temp_brand_storage.pop(chat_id, None)
+
+            cfg = await get_user_settings(chat_id)
+            for b in cfg.get("brands", []):
+                if isinstance(b, dict) and b.get("name", "").lower() == brand_name.lower():
+                    b["max_price"] = new_price
+
+            await save_user_settings(chat_id, cfg)
+            await send_telegram_message(session, chat_id, f"✅ **Ціну оновлено!**\n🏷 Бренд: *{brand_name}*\n💵 Нова макс. ціна: *{new_price} EUR*", await get_main_keyboard(chat_id))
+            return
+
+        if state == "select_brand_for_name_change":
+            raw_selected = text.split(" (")[0]
+            cfg = await get_user_settings(chat_id)
+            found_price = None
+            for b in cfg.get("brands", []):
+                b_name = b.get("name") if isinstance(b, dict) else str(b)
+                if b_name.lower() == raw_selected.lower():
+                    found_price = b.get("max_price", float("inf")) if isinstance(b, dict) else float("inf")
+                    temp_brand_storage[chat_id] = {"old_name": b_name, "price": found_price}
+                    break
+            if found_price is not None:
+                user_states[chat_id] = "waiting_new_name_only"
+                await send_telegram_message(session, chat_id, f"Введіть **нову назву** для бренду *{raw_selected}* (ціна залишиться: *{found_price} EUR*):")
+            else:
+                await send_telegram_message(session, chat_id, "❌ Бренд не знайдено в списку.", await get_main_keyboard(chat_id))
+            return
+
+        if state == "waiting_new_name_only":
+            old_data = temp_brand_storage.get(chat_id, {})
+            old_name = old_data.get("old_name")
+            curr_price = old_data.get("price")
+            new_name = text.strip()
+
+            user_states[chat_id] = None
+            temp_brand_storage.pop(chat_id, None)
+
+            cfg = await get_user_settings(chat_id)
+            for b in cfg.get("brands", []):
+                if isinstance(b, dict) and b.get("name", "").lower() == old_name.lower():
+                    b["name"] = new_name
+
+            await save_user_settings(chat_id, cfg)
+            await send_telegram_message(session, chat_id, f"✅ **Назву бренду змінено!**\n🏷 Було: *{old_name}*\n🏷 Стало: *{new_name}*\n💵 Ціна збережена: *{curr_price} EUR*", await get_main_keyboard(chat_id))
+            return
+
         if state == "waiting_step1_brand_name":
             temp_brand_storage[chat_id] = text
             user_states[chat_id] = "waiting_step2_brand_price"
@@ -427,7 +541,7 @@ async def handle_update(session, update):
             brand_name = temp_brand_storage.get(chat_id, "")
             price_digits = re.findall(r"\d+(?:\.\d+)?", text.replace(",", "."))
             if not price_digits:
-                await send_telegram_message(session, chat_id, "❌ **Будь ласка, введіть суму тільки цифрами!** (наприклад: `75`)")
+                await send_telegram_message(session, chat_id, "❌ **Будь ласка, введіть суму тільки цифрами!** (наприклад: `75`) ")
                 return
 
             max_price = float(price_digits[0])
@@ -500,10 +614,6 @@ async def handle_update(session, update):
         if not await is_user_active(chat_id):
             await send_telegram_message(session, chat_id, "🔒 **Доступ обмежено!** Натисніть кнопку активації ключа.", await get_main_keyboard(chat_id))
             return
-
-        if text in ["➕ Додати бренд", "➕ Додати бренд з ціною", "➕ Додати бренд (МП)"]:
-            user_states[chat_id] = "waiting_step1_brand_name"
-            await send_telegram_message(session, chat_id, "Напишіть **назву бренду** (наприклад: `Stone Island` або `Off White`):")
 
         elif text == "🖼 Пошук за фото":
             await send_telegram_message(session, chat_id, "📸 **Просто надішліть фотографію або скріншот речі в цей чат!**\nБот зчитає картинку та знайде схожі оголошення.")
@@ -623,7 +733,6 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
                     if item.get("promoted") or item.get("is_promoted"):
                         continue
 
-                    # --- СУВОРИЙ ФІЛЬТР ЗА ЧАСОМ ПУБЛІКАЦІЇ ---
                     created_ts = item.get("photo", {}).get("high_resolution", {}).get("timestamp") or item.get("created_at_ts")
                     if not created_ts and "created_at" in item:
                         try:
@@ -634,7 +743,6 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
 
                     if created_ts:
                         item_age = now_ts - int(created_ts)
-                        # Якщо річ викладена раніше ніж 30 хвилин тому — пропускаємо
                         if item_age > max_age_sec:
                             continue
 
