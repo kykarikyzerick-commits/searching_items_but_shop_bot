@@ -57,6 +57,40 @@ DOMAINS = {
     "🇬🇧 Великобританія": {"code": "co.uk", "currency": "GBP"}
 }
 
+# ==================== ВАЛІДАЦІЯ НАЗВИ БРЕНДУ ====================
+def is_valid_brand_name(name: str) -> bool:
+    clean_name = name.strip()
+    
+    # 1. Довжина має бути мінімум 2 символи
+    if len(clean_name) < 2:
+        return False
+
+    # 2. Перевірка на занадто довгі повтори однакових символів (наприклад "aaaaa")
+    if re.search(r'(.)\1{2,}', clean_name.lower()):
+        return False
+
+    # 3. Перевірка на популярні послідовності клавіатури (qwerty, asdf, zxcv тощо)
+    keyboard_patterns = ["qwerty", "asdfgh", "zxcvbn", "12345", "123456", "qwer", "asdf", "zxcv"]
+    if any(pattern in clean_name.lower() for pattern in keyboard_patterns):
+        return False
+
+    # 4. Перевірка: тільки букви, цифри, пробіли та дефіси/апострофи
+    if not re.match(r"^[a-zA-Z0-9\s\-\'\&\.а-щьюяа-щьюяіїєґА-ЩЬЮЯА-ЩЬЮЯІЇЄҐ]+$", clean_name):
+        return False
+
+    # 5. Перевірка на занадто довгі ланцюжки приголосних поспіль (відсікає "ghjklmn")
+    vowels = "aeiouyаеєиіоуюя"
+    consonant_count = 0
+    for char in clean_name.lower():
+        if char.isalpha() and char not in vowels:
+            consonant_count += 1
+            if consonant_count >= 5:  # Більше 4 приголосних поспіль — підозріло
+                return False
+        else:
+            consonant_count = 0
+
+    return True
+
 # ==================== MONGODB СТАН ТА ЗМІННІ ====================
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client["vinted_bot_db"]
@@ -515,10 +549,23 @@ async def handle_update(session, update):
             curr_price = old_data.get("price")
             new_name = text.strip()
 
+            # ПЕРЕВІРКА ВАЛІДНОСТІ ТА ДУБЛІКАТІВ
+            if not is_valid_brand_name(new_name):
+                await send_telegram_message(session, chat_id, "❌ **Некоректна назва бренду!** Будь ласка, введіть реальну назву (без випадкових букв чи символів):")
+                return
+
+            cfg = await get_user_settings(chat_id)
+            for b in cfg.get("brands", []):
+                existing_name = b.get("name") if isinstance(b, dict) else str(b)
+                if existing_name.lower() == new_name.lower():
+                    await send_telegram_message(session, chat_id, f"❌ Бренд *{new_name}* вже є у вашому списку!", await get_main_keyboard(chat_id))
+                    user_states[chat_id] = None
+                    temp_brand_storage.pop(chat_id, None)
+                    return
+
             user_states[chat_id] = None
             temp_brand_storage.pop(chat_id, None)
 
-            cfg = await get_user_settings(chat_id)
             for b in cfg.get("brands", []):
                 if isinstance(b, dict) and b.get("name", "").lower() == old_name.lower():
                     b["name"] = new_name
@@ -528,12 +575,37 @@ async def handle_update(session, update):
             return
 
         if state == "waiting_step1_brand_name":
-            temp_brand_storage[chat_id] = text
+            brand_name_candidate = text.strip()
+
+            # 1. ПЕРЕВІРКА НА РАНДОМНІ БУКВИ / СМІТТЯ
+            if not is_valid_brand_name(brand_name_candidate):
+                await send_telegram_message(
+                    session, 
+                    chat_id, 
+                    "❌ **Некоректна назва бренду!**\nСхоже, ви ввели випадковий набір букв чи символів. Напишіть нормальну назву бренду (наприклад: `Stone Island`):"
+                )
+                return
+
+            # 2. ПЕРЕВІРКА НА ПОВТОРЕННЯ (ПЕРЕВІРКА ДУБЛІКАТІВ)
+            cfg = await get_user_settings(chat_id)
+            for b in cfg.get("brands", []):
+                existing_name = b.get("name") if isinstance(b, dict) else str(b)
+                if existing_name.lower() == brand_name_candidate.lower():
+                    user_states[chat_id] = None
+                    await send_telegram_message(
+                        session, 
+                        chat_id, 
+                        f"⚠️ **Бренд *{existing_name}* вже є у вашому списку!**\nЯкщо ви хочете змінити для нього ціну, скористайтеся кнопкою *💰 Змінити ціну існуючого бренду*.", 
+                        await get_brand_management_keyboard(chat_id)
+                    )
+                    return
+
+            temp_brand_storage[chat_id] = brand_name_candidate
             user_states[chat_id] = "waiting_step2_brand_price"
             await send_telegram_message(
                 session, 
                 chat_id, 
-                f"🏷 Бренд: *{text}*\n\nТепер напишіть **максимальну ціну** для цього бренду цифрами (наприклад: `75`):"
+                f"🏷 Бренд: *{brand_name_candidate}*\n\nТепер напишіть **максимальну ціну** для цього бренду цифрами (наприклад: `75`):"
             )
             return
 
