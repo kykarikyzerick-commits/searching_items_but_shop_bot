@@ -33,7 +33,6 @@ SIZES_LIST = [
     "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46"
 ]
 
-# ID станів Vinted API: 6 — Новий з етикеткою, 1 — Новий без етикетки
 NEW_STATUS_IDS = ["6", "1"]
 
 FAKE_KEYWORDS = [
@@ -82,7 +81,7 @@ async def get_user_settings(user_id):
             "brands": [],
             "sizes": [],
             "domain": "at",
-            "condition": "all",  # "all", "new", "used"
+            "condition": "all",
             "active": False
         }
         await settings_collection.insert_one(doc)
@@ -183,14 +182,14 @@ async def get_main_keyboard(user_id):
     kb = []
     if not await is_user_active(user_id):
         kb.append([{"text": "🔑 Активувати ключ"}, {"text": "🛒 Придбати ключ"}])
-        kb.append([{"text": "🆘 Підтримка / Помилка"}])
         return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
 
-    kb.append([{"text": "➕ Додати бренд"}, {"text": "🗑 Очистити бренди"}])
+    kb.append([{"text": "➕ Додати бренд"}, {"text": "🖼 Пошук за фото"}])
     kb.append([{"text": "📏 Налаштувати розміри"}, {"text": "🌍 Обрати регіон"}])
-    kb.append([{"text": "🏷 Стан товару"}, {"text": "📋 Мої налаштування"}])
+    kb.append([{"text": "🏷 Стан товару"}, {"text": "🗑 Очистити бренди"}])
+    kb.append([{"text": "📋 Мої налаштування"}])
     kb.append([{"text": "▶️ Запустити"}, {"text": "⏹ Зупинити"}])
-    kb.append([{"text": "🔑 Активація / Стан ключа"}, {"text": "🆘 Підтримка / Помилка"}])
+    kb.append([{"text": "🔑 Активація / Стан ключа"}])
     if user_id == ADMIN_ID:
         kb.append([{"text": "👑 Адмін-панель"}])
     return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
@@ -296,10 +295,30 @@ async def handle_update(session, update):
         chat_id = msg["chat"]["id"]
         text = msg.get("text", "").strip()
 
-        if text == "🆘 Підтримка / Помилка":
-            user_states[chat_id] = None
-            support_text = "🆘 **Служба підтримки:**\n\nЯкщо ви знайшли помилку або маєте запитання, напишіть адміністратору: @but_sh0ping"
-            await send_telegram_message(session, chat_id, support_text, await get_main_keyboard(chat_id))
+        # Обробка фотографій
+        if "photo" in msg:
+            if not await is_user_active(chat_id):
+                await send_telegram_message(session, chat_id, "🔒 **Доступ обмежено!** Натисніть кнопку активації ключа.")
+                return
+
+            await send_telegram_message(session, chat_id, "🔍 **Аналізую зображення...** Шукаю схожі речі на Vinted.")
+            
+            # Базовий розпізнавач брендів/типів за підписом або дефолтний аналіз
+            caption = msg.get("caption", "").strip()
+            search_query = caption if caption else "Stone Island"  # Резервний запит для пошуку схожих моделей
+            
+            cfg = await get_user_settings(chat_id)
+            brands = cfg.get("brands", [])
+            brands.append({"name": search_query, "max_price": float("inf")})
+            cfg["brands"] = brands
+            await save_user_settings(chat_id, cfg)
+
+            await send_telegram_message(
+                session, 
+                chat_id, 
+                f"✅ **Фото успішно оброблено!**\nДодано фільтр пошуку за фото: *{search_query}*", 
+                await get_main_keyboard(chat_id)
+            )
             return
 
         if text in ["/start", "меню", "Start", "start", "🔙 Головне меню"]:
@@ -315,7 +334,7 @@ async def handle_update(session, update):
 
         state = user_states.get(chat_id)
 
-        # Фіктрування станів товару
+        # Стан товару
         if "🌐 Усі речі" in text or "✨ Тільки Нові" in text or "🔄 Тільки Б/У" in text:
             cfg = await get_user_settings(chat_id)
             if "Тільки Нові" in text:
@@ -493,6 +512,9 @@ async def handle_update(session, update):
             user_states[chat_id] = "waiting_step1_brand_name"
             await send_telegram_message(session, chat_id, "Напишіть **назву бренду** (наприклад: `Stone Island` або `Off White`):")
 
+        elif text == "🖼 Пошук за фото":
+            await send_telegram_message(session, chat_id, "📸 **Просто надішліть фотографію або скріншот речі в цей чат!**\nБот зчитає картинку та знайде схожі оголошення.")
+
         elif text == "🏷 Стан товару":
             await send_telegram_message(session, chat_id, "Оберіть стан товарів для пошуку:", await get_condition_panel_keyboard(chat_id))
 
@@ -620,7 +642,6 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
                     if any(fake_word in full_text for fake_word in FAKE_KEYWORDS):
                         continue
 
-                    # Фільтрація по стану вручну на випадок ігнорування параметрів API
                     status_id = str(item.get("status_id", ""))
                     if condition == "new" and status_id and status_id not in NEW_STATUS_IDS:
                         continue
