@@ -61,30 +61,25 @@ DOMAINS = {
 def is_valid_brand_name(name: str) -> bool:
     clean_name = name.strip()
     
-    # 1. Довжина має бути мінімум 2 символи
     if len(clean_name) < 2:
         return False
 
-    # 2. Перевірка на занадто довгі повтори однакових символів (наприклад "aaaaa")
     if re.search(r'(.)\1{2,}', clean_name.lower()):
         return False
 
-    # 3. Перевірка на популярні послідовності клавіатури (qwerty, asdf, zxcv тощо)
     keyboard_patterns = ["qwerty", "asdfgh", "zxcvbn", "12345", "123456", "qwer", "asdf", "zxcv"]
     if any(pattern in clean_name.lower() for pattern in keyboard_patterns):
         return False
 
-    # 4. Перевірка: тільки букви, цифри, пробіли та дефіси/апострофи
     if not re.match(r"^[a-zA-Z0-9\s\-\'\&\.а-щьюяа-щьюяіїєґА-ЩЬЮЯА-ЩЬЮЯІЇЄҐ]+$", clean_name):
         return False
 
-    # 5. Перевірка на занадто довгі ланцюжки приголосних поспіль (відсікає "ghjklmn")
     vowels = "aeiouyаеєиіоуюя"
     consonant_count = 0
     for char in clean_name.lower():
         if char.isalpha() and char not in vowels:
             consonant_count += 1
-            if consonant_count >= 5:  # Більше 4 приголосних поспіль — підозріло
+            if consonant_count >= 5:
                 return False
         else:
             consonant_count = 0
@@ -100,6 +95,7 @@ seen_items_collection = db["seen_items"]
 
 user_states = {}
 temp_brand_storage = {}
+active_users_cache = {}  # КЕШ ДЛЯ МИТТЄВОЇ ЗУПИНКИ
 last_update_id = 0
 vinted_cookies = {}
 processed_updates = set()
@@ -121,11 +117,17 @@ async def get_user_settings(user_id):
             "active": False
         }
         await settings_collection.insert_one(doc)
+    
+    active_users_cache[int(user_id)] = doc.get("active", False)
     return doc
 
 async def save_user_settings(user_id, settings):
     uid_str = str(user_id)
     settings["user_id"] = uid_str
+    
+    if "active" in settings:
+        active_users_cache[int(user_id)] = settings["active"]
+
     await settings_collection.update_one(
         {"user_id": uid_str},
         {"$set": settings},
@@ -229,6 +231,16 @@ async def get_main_keyboard(user_id):
     if user_id == ADMIN_ID:
         kb.append([{"text": "👑 Адмін-панель"}])
     return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
+
+def get_confirm_clear_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "⚠️ Так, видалити всі бренди"}],
+            [{"text": "🔙 Скасувати та повернутися"}]
+        ],
+        "resize_keyboard": True,
+        "persistent": True
+    }
 
 async def get_brand_management_keyboard(user_id):
     cfg = await get_user_settings(user_id)
@@ -376,7 +388,7 @@ async def handle_update(session, update):
             )
             return
 
-        if text in ["/start", "меню", "Start", "start", "🔙 Головне меню"]:
+        if text in ["/start", "меню", "Start", "start", "🔙 Головне меню", "🔙 Скасувати та повернутися"]:
             user_states[chat_id] = None
             temp_brand_storage.pop(chat_id, None)
             await send_telegram_message(
@@ -388,6 +400,45 @@ async def handle_update(session, update):
             return
 
         state = user_states.get(chat_id)
+
+        if text == "⏹ Зупинити":
+            cfg = await get_user_settings(chat_id)
+            cfg["active"] = False
+            active_users_cache[chat_id] = False
+            await save_user_settings(chat_id, cfg)
+            await send_telegram_message(session, chat_id, "⏹ **Пошук повністю зупинено!**", await get_main_keyboard(chat_id))
+            return
+
+        if text == "▶️ Запустити":
+            cfg = await get_user_settings(chat_id)
+            cfg["active"] = True
+            active_users_cache[chat_id] = True
+            await save_user_settings(chat_id, cfg)
+            await send_telegram_message(session, chat_id, "🚀 **Пошук речей запущено!**", await get_main_keyboard(chat_id))
+            return
+
+        if text == "🗑 Очистити бренди":
+            user_states[chat_id] = "confirm_clear_brands"
+            await send_telegram_message(
+                session, 
+                chat_id, 
+                "⚠️ **Ви дійсно хочете очистити весь список брендів?**\n\nЯкщо очистити бренди, бот почне надсилати **ВСІ** нові речі з Vinted підряд!", 
+                get_confirm_clear_keyboard()
+            )
+            return
+
+        if state == "confirm_clear_brands" and text == "⚠️ Так, видалити всі бренди":
+            user_states[chat_id] = None
+            cfg = await get_user_settings(chat_id)
+            cfg["brands"] = []
+            await save_user_settings(chat_id, cfg)
+            await send_telegram_message(
+                session, 
+                chat_id, 
+                "🗑 **Список брендів очищено.**\nБот тепер шукає всі товари поспіль.", 
+                await get_main_keyboard(chat_id)
+            )
+            return
 
         if "🌐 Усі речі" in text or "✨ Тільки Нові" in text or "🔄 Тільки Б/У" in text:
             cfg = await get_user_settings(chat_id)
@@ -549,9 +600,8 @@ async def handle_update(session, update):
             curr_price = old_data.get("price")
             new_name = text.strip()
 
-            # ПЕРЕВІРКА ВАЛІДНОСТІ ТА ДУБЛІКАТІВ
             if not is_valid_brand_name(new_name):
-                await send_telegram_message(session, chat_id, "❌ **Некоректна назва бренду!** Будь ласка, введіть реальну назву (без випадкових букв чи символів):")
+                await send_telegram_message(session, chat_id, "❌ **Некоректна назва бренду!** Будь ласка, введіть реальну назву:")
                 return
 
             cfg = await get_user_settings(chat_id)
@@ -577,16 +627,14 @@ async def handle_update(session, update):
         if state == "waiting_step1_brand_name":
             brand_name_candidate = text.strip()
 
-            # 1. ПЕРЕВІРКА НА РАНДОМНІ БУКВИ / СМІТТЯ
             if not is_valid_brand_name(brand_name_candidate):
                 await send_telegram_message(
                     session, 
                     chat_id, 
-                    "❌ **Некоректна назва бренду!**\nСхоже, ви ввели випадковий набір букв чи символів. Напишіть нормальну назву бренду (наприклад: `Stone Island`):"
+                    "❌ **Некоректна назва бренду!** Напишіть нормальну назву бренду (наприклад: `Stone Island`):"
                 )
                 return
 
-            # 2. ПЕРЕВІРКА НА ПОВТОРЕННЯ (ПЕРЕВІРКА ДУБЛІКАТІВ)
             cfg = await get_user_settings(chat_id)
             for b in cfg.get("brands", []):
                 existing_name = b.get("name") if isinstance(b, dict) else str(b)
@@ -595,7 +643,7 @@ async def handle_update(session, update):
                     await send_telegram_message(
                         session, 
                         chat_id, 
-                        f"⚠️ **Бренд *{existing_name}* вже є у вашому списку!**\nЯкщо ви хочете змінити для нього ціну, скористайтеся кнопкою *💰 Змінити ціну існуючого бренду*.", 
+                        f"⚠️ **Бренд *{existing_name}* вже є у вашому списку!**", 
                         await get_brand_management_keyboard(chat_id)
                     )
                     return
@@ -613,7 +661,7 @@ async def handle_update(session, update):
             brand_name = temp_brand_storage.get(chat_id, "")
             price_digits = re.findall(r"\d+(?:\.\d+)?", text.replace(",", "."))
             if not price_digits:
-                await send_telegram_message(session, chat_id, "❌ **Будь ласка, введіть суму тільки цифрами!** (наприклад: `75`) ")
+                await send_telegram_message(session, chat_id, "❌ **Введіть суму цифрами!** (наприклад: `75`) ")
                 return
 
             max_price = float(price_digits[0])
@@ -688,16 +736,10 @@ async def handle_update(session, update):
             return
 
         elif text == "🖼 Пошук за фото":
-            await send_telegram_message(session, chat_id, "📸 **Просто надішліть фотографію або скріншот речі в цей чат!**\nБот зчитає картинку та знайде схожі оголошення.")
+            await send_telegram_message(session, chat_id, "📸 **Просто надішліть фотографію або скріншот речі в цей чат!**")
 
         elif text == "🏷 Стан товару":
             await send_telegram_message(session, chat_id, "Оберіть стан товарів для пошуку:", await get_condition_panel_keyboard(chat_id))
-
-        elif text == "🗑 Очистити бренди":
-            cfg = await get_user_settings(chat_id)
-            cfg["brands"] = []
-            await save_user_settings(chat_id, cfg)
-            await send_telegram_message(session, chat_id, "🗑 Список брендів очищено. **Бот тепер надсилатиме ВСІ речі!**", await get_main_keyboard(chat_id))
 
         elif text == "📏 Налаштувати розміри":
             await send_telegram_message(session, chat_id, "Оберіть розміри на нижній панелі:", await get_sizes_panel_keyboard(chat_id))
@@ -733,18 +775,6 @@ async def handle_update(session, update):
             info = f"⚙️ **Налаштування:**\n\n🏷 **Бренди та ліміти:**\n• {brands_str}\n\n📏 **Розміри:** {sizes}\n🏷 **Стан:** {cond_str}\n🌍 **Регіон:** {domain}\n📡 **Статус:** {status}"
             await send_telegram_message(session, chat_id, info, await get_main_keyboard(chat_id))
 
-        elif text == "▶️ Запустити":
-            cfg = await get_user_settings(chat_id)
-            cfg["active"] = True
-            await save_user_settings(chat_id, cfg)
-            await send_telegram_message(session, chat_id, "🚀 Пошук речей запущено!", await get_main_keyboard(chat_id))
-
-        elif text == "⏹ Зупинити":
-            cfg = await get_user_settings(chat_id)
-            cfg["active"] = False
-            await save_user_settings(chat_id, cfg)
-            await send_telegram_message(session, chat_id, "⏹ Пошук зупинено.", await get_main_keyboard(chat_id))
-
 # ==================== ОПТИМІЗОВАНИЙ ПАРСИНГ VINTED ====================
 async def get_vinted_cookie(session, domain):
     if domain in vinted_cookies and vinted_cookies[domain]:
@@ -767,6 +797,10 @@ async def get_vinted_cookie(session, domain):
         return ""
 
 async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, condition, headers):
+    # ПЕРЕВІРКА АКТИВНОСТІ КОРИСТУВАЧА ПЕРЕД ЗДІЙСНЕННЯМ ЗАПИТУ
+    if not active_users_cache.get(user_id, False):
+        return
+
     status_param = ""
     if condition == "new":
         status_param = "&status_ids[]=6&status_ids[]=1"
@@ -802,6 +836,10 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
                 max_age_sec = MAX_ITEM_AGE_MINUTES * 60
 
                 for item in items:
+                    # МИТТЄВА ПЕРЕВІРКА ЗУПИНКИ ПРИ ОБРОБЦІ СПИСКУ
+                    if not active_users_cache.get(user_id, False):
+                        return
+
                     if item.get("promoted") or item.get("is_promoted"):
                         continue
 
@@ -884,10 +922,12 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
 
                     keyboard = get_item_keyboard(item_url)
 
-                    if photo_url:
-                        asyncio.create_task(send_telegram_photo(session, user_id, photo_url, caption, keyboard))
-                    else:
-                        asyncio.create_task(send_telegram_message(session, user_id, caption, keyboard))
+                    # ПЕРЕВІРКА ПЕРЕД НАДСИЛАННЯМ ПОВІДОМЛЕННЯ
+                    if active_users_cache.get(user_id, False):
+                        if photo_url:
+                            asyncio.create_task(send_telegram_photo(session, user_id, photo_url, caption, keyboard))
+                        else:
+                            asyncio.create_task(send_telegram_message(session, user_id, caption, keyboard))
     except Exception:
         pass
 
@@ -896,6 +936,8 @@ async def fetch_vinted(session):
     cursor = settings_collection.find({"active": True})
     async for config in cursor:
         user_id = int(config.get("user_id"))
+        active_users_cache[user_id] = True
+
         if not await is_user_active(user_id):
             continue
 
