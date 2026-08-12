@@ -19,10 +19,10 @@ ADMIN_ID = 8138110821
 
 MONGO_URI = "mongodb+srv://kykarikyzerick_db_user:CVz4czwK06sgQlSP@cluster0.xuoxdku.mongodb.net/?appName=Cluster0"
 
-CHECK_INTERVAL = 0.1
+CHECK_INTERVAL = 0.05  # Максимальна швидкість перевірки
 ALLOWED_USERS = [8138110821]
 EUR_TO_UAH_RATE = 51.0
-MAX_ITEM_AGE_MINUTES = 30  # Жорсткий фільтр на 30 хвилин
+MAX_ITEM_AGE_MINUTES = 30 
 
 MASTER_KEYS = {
     "VINTED-VIP-2026": 365,
@@ -50,7 +50,7 @@ DOMAINS = {
     "🇵🇱 Польща": {"code": "pl", "currency": "PLN"},
     "🇦🇹 Австрія": {"code": "at", "currency": "EUR"},
     "🇨🇿 Чехія": {"code": "cz", "currency": "CZK"},
-    "🇱🇹 Литва": {"code": "lt", "currency": "EUR"},
+    "🇱Т Литва": {"code": "lt", "currency": "EUR"},
     "🇷🇴 Румунія": {"code": "ro", "currency": "RON"},
     "🇩🇪 Німеччина": {"code": "de", "currency": "EUR"},
     "🇫🇷 Франція": {"code": "fr", "currency": "EUR"},
@@ -60,20 +60,15 @@ DOMAINS = {
 # ==================== ВАЛІДАЦІЯ НАЗВИ БРЕНДУ ====================
 def is_valid_brand_name(name: str) -> bool:
     clean_name = name.strip()
-    
     if len(clean_name) < 2:
         return False
-
     if re.search(r'(.)\1{2,}', clean_name.lower()):
         return False
-
     keyboard_patterns = ["qwerty", "asdfgh", "zxcvbn", "12345", "123456", "qwer", "asdf", "zxcv"]
     if any(pattern in clean_name.lower() for pattern in keyboard_patterns):
         return False
-
     if not re.match(r"^[a-zA-Z0-9\s\-\'\&\.а-щьюяа-щьюяіїєґА-ЩЬЮЯА-ЩЬЮЯІЇЄҐ]+$", clean_name):
         return False
-
     vowels = "aeiouyаеєиіоуюя"
     consonant_count = 0
     for char in clean_name.lower():
@@ -83,7 +78,6 @@ def is_valid_brand_name(name: str) -> bool:
                 return False
         else:
             consonant_count = 0
-
     return True
 
 # ==================== MONGODB СТАН ТА ЗМІННІ ====================
@@ -95,13 +89,17 @@ seen_items_collection = db["seen_items"]
 
 user_states = {}
 temp_brand_storage = {}
-active_users_cache = {}  # КЕШ ДЛЯ МИТТЄВОЇ ЗУПИНКИ
+active_users_cache = {}  
+seen_items_cache = set()  # КЕШ У ПАМ'ЯТІ ДЛЯ МИТТЄВОЇ ПЕРЕВІРКИ ТОВАРІВ
 last_update_id = 0
 vinted_cookies = {}
 processed_updates = set()
 
 async def init_db_indexes():
     await seen_items_collection.create_index("item_id", unique=True)
+    # Завантаження останніх 5000 побачених товарів у оперативку при старті
+    async for doc in seen_items_collection.find().sort("_id", -1).limit(5000):
+        seen_items_cache.add(str(doc.get("item_id")))
 
 # ==================== РОБОТА З БД ====================
 async def get_user_settings(user_id):
@@ -134,15 +132,18 @@ async def save_user_settings(user_id, settings):
         upsert=True
     )
 
-async def is_item_seen(item_id):
-    doc = await seen_items_collection.find_one({"item_id": str(item_id)})
-    return doc is not None
+def is_item_seen_fast(item_id):
+    return str(item_id) in seen_items_cache
 
 async def mark_item_seen(item_id):
+    item_str = str(item_id)
+    seen_items_cache.add(item_str)
+    if len(seen_items_cache) > 10000:
+        seen_items_cache.clear()
     try:
         await seen_items_collection.update_one(
-            {"item_id": str(item_id)},
-            {"$set": {"item_id": str(item_id), "added_at": datetime.now()}},
+            {"item_id": item_str},
+            {"$set": {"item_id": item_str, "added_at": datetime.now()}},
             upsert=True
         )
     except Exception:
@@ -335,7 +336,7 @@ async def send_telegram_message(session, chat_id, text, reply_markup=None):
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
     try:
-        async with session.post(url, json=payload, timeout=3) as resp:
+        async with session.post(url, json=payload, timeout=2) as resp:
             return await resp.json()
     except Exception as e:
         logging.error(f"Telegram Send Error: {e}")
@@ -346,7 +347,7 @@ async def send_telegram_photo(session, chat_id, photo_url, caption, reply_markup
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
     try:
-        async with session.post(url, json=payload, timeout=3) as resp:
+        async with session.post(url, json=payload, timeout=2) as resp:
             return await resp.json()
     except Exception as e:
         logging.error(f"Telegram Photo Error: {e}")
@@ -364,6 +365,18 @@ async def handle_update(session, update):
         msg = update["message"]
         chat_id = msg["chat"]["id"]
         text = msg.get("text", "").strip()
+
+        # ГЛОБАЛЬНЕ СКАСУВАННЯ ТА ПОВЕРНЕННЯ В МЕНЮ
+        if text in ["/start", "меню", "Start", "start", "🔙 Головне меню", "🔙 Скасувати та повернутися"]:
+            user_states[chat_id] = None
+            temp_brand_storage.pop(chat_id, None)
+            await send_telegram_message(
+                session, 
+                chat_id, 
+                "👋 **Панель керування бота:**", 
+                await get_main_keyboard(chat_id)
+            )
+            return
 
         if "photo" in msg:
             if not await is_user_active(chat_id):
@@ -384,17 +397,6 @@ async def handle_update(session, update):
                 session, 
                 chat_id, 
                 f"✅ **Фото успішно оброблено!**\nДодано фільтр пошуку за фото: *{search_query}*", 
-                await get_main_keyboard(chat_id)
-            )
-            return
-
-        if text in ["/start", "меню", "Start", "start", "🔙 Головне меню", "🔙 Скасувати та повернутися"]:
-            user_states[chat_id] = None
-            temp_brand_storage.pop(chat_id, None)
-            await send_telegram_message(
-                session, 
-                chat_id, 
-                "👋 **Панель керування бота:**", 
                 await get_main_keyboard(chat_id)
             )
             return
@@ -787,7 +789,7 @@ async def get_vinted_cookie(session, domain):
     }
     url = f"https://www.vinted.{domain}"
     try:
-        async with session.get(url, headers=headers, timeout=3) as resp:
+        async with session.get(url, headers=headers, timeout=2) as resp:
             cookies = resp.cookies
             cookie_str = "; ".join([f"{k}={v.value}" for k, v in cookies.items()])
             if cookie_str:
@@ -796,8 +798,29 @@ async def get_vinted_cookie(session, domain):
     except Exception:
         return ""
 
+# НАДТОЧНИЙ ВИЗНАЧНИК ЦІНИ
+def extract_item_price(item: dict) -> float:
+    try:
+        if "price_numeric" in item and item["price_numeric"] is not None:
+            return float(item["price_numeric"])
+    except (ValueError, TypeError):
+        pass
+
+    raw_price = item.get("price")
+    if isinstance(raw_price, dict):
+        try:
+            return float(str(raw_price.get("amount", 0)).replace(",", "."))
+        except (ValueError, TypeError):
+            pass
+    elif isinstance(raw_price, (int, float, str)):
+        try:
+            return float(str(raw_price).replace(",", "."))
+        except (ValueError, TypeError):
+            pass
+
+    return 0.0
+
 async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, condition, headers):
-    # ПЕРЕВІРКА АКТИВНОСТІ КОРИСТУВАЧА ПЕРЕД ЗДІЙСНЕННЯМ ЗАПИТУ
     if not active_users_cache.get(user_id, False):
         return
 
@@ -822,7 +845,7 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
         api_url = f"https://www.vinted.{domain}/api/v2/catalog/items?order=newest_first&per_page=30{status_param}"
 
     try:
-        async with session.get(api_url, headers=headers, timeout=3) as resp:
+        async with session.get(api_url, headers=headers, timeout=2) as resp:
             if resp.status in (401, 403, 429):
                 vinted_cookies.pop(domain, None)
                 return
@@ -836,11 +859,19 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
                 max_age_sec = MAX_ITEM_AGE_MINUTES * 60
 
                 for item in items:
-                    # МИТТЄВА ПЕРЕВІРКА ЗУПИНКИ ПРИ ОБРОБЦІ СПИСКУ
                     if not active_users_cache.get(user_id, False):
                         return
 
                     if item.get("promoted") or item.get("is_promoted"):
+                        continue
+
+                    item_id = str(item.get("id", ""))
+                    if not item_id or is_item_seen_fast(item_id):
+                        continue
+
+                    # ЖОРСТКА ПЕРЕВІРКА ЦІНИ (ВИПРАВЛЕНО БАГ З ХИБНИМИ ЦІНАМИ)
+                    item_price = extract_item_price(item)
+                    if max_price < float("inf") and item_price > max_price:
                         continue
 
                     created_ts = item.get("photo", {}).get("high_resolution", {}).get("timestamp") or item.get("created_at_ts")
@@ -855,10 +886,6 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
                         item_age = now_ts - int(created_ts)
                         if item_age > max_age_sec:
                             continue
-
-                    item_id = str(item.get("id", ""))
-                    if not item_id or await is_item_seen(item_id):
-                        continue
 
                     title = str(item.get("title", ""))
                     description = str(item.get("description", ""))
@@ -875,23 +902,6 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
                     if condition == "new" and status_id and status_id not in NEW_STATUS_IDS:
                         continue
                     elif condition == "used" and status_id in NEW_STATUS_IDS:
-                        continue
-
-                    item_price = 0.0
-                    if "price_numeric" in item and item["price_numeric"] is not None:
-                        try: item_price = float(item["price_numeric"])
-                        except ValueError: pass
-
-                    if item_price == 0.0:
-                        raw_price = item.get("price")
-                        if isinstance(raw_price, (int, float, str)):
-                            try: item_price = float(str(raw_price).replace(",", "."))
-                            except ValueError: pass
-                        elif isinstance(raw_price, dict):
-                            try: item_price = float(str(raw_price.get("amount", 0)).replace(",", "."))
-                            except ValueError: pass
-
-                    if max_price < float("inf") and item_price > (max_price + 0.01):
                         continue
 
                     size_title = str(item.get("size_title", "")).upper()
@@ -922,7 +932,6 @@ async def process_brand_search(session, user_id, brand_obj, domain, user_sizes, 
 
                     keyboard = get_item_keyboard(item_url)
 
-                    # ПЕРЕВІРКА ПЕРЕД НАДСИЛАННЯМ ПОВІДОМЛЕННЯ
                     if active_users_cache.get(user_id, False):
                         if photo_url:
                             asyncio.create_task(send_telegram_photo(session, user_id, photo_url, caption, keyboard))
@@ -990,7 +999,7 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    connector = aiohttp.TCPConnector(limit=300, ttl_dns_cache=300)
+    connector = aiohttp.TCPConnector(limit=500, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=connector) as session:
         while True:
             await handle_telegram_commands(session)
