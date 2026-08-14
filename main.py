@@ -347,7 +347,7 @@ async def send_telegram_photo(session, chat_id, photo_url, caption, reply_markup
     except Exception as e:
         logging.error(f"Telegram Photo Error: {e}")
 
-# ==================== VINTED API (ОНОВЛЕНО ДЛЯ РОБОТИ БЕЗ БЛОКУВАНЬ) ====================
+# ==================== VINTED API ====================
 async def refresh_vinted_session(session, domain="at"):
     url = f"https://www.vinted.{domain}"
     user_agent = random.choice(USER_AGENTS)
@@ -380,7 +380,6 @@ async def refresh_vinted_session(session, domain="at"):
 
 async def fetch_vinted_items(session, domain="at"):
     sess = vinted_session_data.get(domain)
-    # Якщо сесії немає або їй більше 10 хвилин - оновлюємо
     if not sess or (time.time() - sess.get("updated_at", 0) > 600):
         sess = await refresh_vinted_session(session, domain)
 
@@ -412,7 +411,7 @@ async def fetch_vinted_items(session, domain="at"):
         logging.error(f"Error fetching from Vinted [{domain}]: {e}")
     return []
 
-# ==================== РОЗСИЛКА ЗНАХІДОК ====================
+# ==================== РОЗСИЛКА ЗНАХІДОК (ВИПРАВЛЕНО ТИПИ ЦІНИ) ====================
 async def process_and_notify_items(session, items, domain):
     if not items:
         return
@@ -437,8 +436,20 @@ async def process_and_notify_items(session, items, domain):
             await mark_item_seen(item_id)
             continue
 
-        price_amount = float(item.get("price", 0))
+        # БЕЗПЕЧНЕ ИЗВЛЕЧЕНИЕ ЦІНИ
+        raw_price = item.get("price")
+        if isinstance(raw_price, dict):
+            price_amount = float(raw_price.get("amount") or raw_price.get("price") or 0)
+        else:
+            try:
+                price_amount = float(raw_price) if raw_price is not None else 0.0
+            except (ValueError, TypeError):
+                price_amount = 0.0
+
         currency = item.get("currency", "EUR")
+        if isinstance(currency, dict):
+            currency = currency.get("code", "EUR")
+
         price_uah = round(price_amount * EUR_TO_UAH_RATE)
         
         brand_title = item.get("brand_title", "Unbranded")
@@ -482,7 +493,12 @@ async def process_and_notify_items(session, items, domain):
             else:
                 for b in user_brands:
                     b_name = b.get("name", "").lower() if isinstance(b, dict) else str(b).lower()
-                    b_max_price = float(b.get("max_price", float("inf"))) if isinstance(b, dict) else float("inf")
+                    
+                    b_max_price_raw = b.get("max_price", float("inf")) if isinstance(b, dict) else float("inf")
+                    try:
+                        b_max_price = float(b_max_price_raw)
+                    except (ValueError, TypeError):
+                        b_max_price = float("inf")
                     
                     if b_name in combined_text or b_name in brand_title.lower():
                         if price_amount <= b_max_price:
@@ -499,7 +515,7 @@ async def process_and_notify_items(session, items, domain):
                     f"✨ **Стан:** {'Новий' if is_new else 'Б/У'}\n"
                 )
                 await send_telegram_photo(session, user_id, photo_url, caption, get_item_keyboard(item_url))
-                logging.info(f"Notification sent to user {user_id} for item {item_id}")
+                logging.info(f"Успішно надіслано товар {item_id} для {user_id}")
 
         await mark_item_seen(item_id)
 
