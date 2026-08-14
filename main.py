@@ -19,7 +19,7 @@ ADMIN_ID = 8138110821
 
 MONGO_URI = "mongodb+srv://kykarikyzerick_db_user:CVz4czwK06sgQlSP@cluster0.xuoxdku.mongodb.net/?appName=Cluster0"
 
-CHECK_INTERVAL = 0.05  # Максимальна швидкість перевірки
+CHECK_INTERVAL = 1.0  # Інтервал перевірки (Vinted блокує за запити частіше ніж 1 сек)
 ALLOWED_USERS = [8138110821]
 EUR_TO_UAH_RATE = 51.0
 MAX_ITEM_AGE_MINUTES = 30 
@@ -57,6 +57,12 @@ DOMAINS = {
     "🇬🇧 Великобританія": {"code": "co.uk", "currency": "GBP"}
 }
 
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+]
+
 # ==================== ВАЛІДАЦІЯ НАЗВИ БРЕНДУ ====================
 def is_valid_brand_name(name: str) -> bool:
     clean_name = name.strip()
@@ -92,7 +98,7 @@ temp_brand_storage = {}
 active_users_cache = {}  
 seen_items_cache = set()  # КЕШ У ПАМ'ЯТІ ДЛЯ МИТТЄВОЇ ПЕРЕВІРКИ ТОВАРІВ
 last_update_id = 0
-vinted_cookies = {}
+vinted_session_data = {} # Зберігає cookie та oauth token для кожного домену
 processed_updates = set()
 
 async def init_db_indexes():
@@ -336,7 +342,7 @@ async def send_telegram_message(session, chat_id, text, reply_markup=None):
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
     try:
-        async with session.post(url, json=payload, timeout=2) as resp:
+        async with session.post(url, json=payload, timeout=5) as resp:
             return await resp.json()
     except Exception as e:
         logging.error(f"Telegram Send Error: {e}")
@@ -347,43 +353,65 @@ async def send_telegram_photo(session, chat_id, photo_url, caption, reply_markup
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
     try:
-        async with session.post(url, json=payload, timeout=2) as resp:
+        async with session.post(url, json=payload, timeout=5) as resp:
             return await resp.json()
     except Exception as e:
         logging.error(f"Telegram Photo Error: {e}")
 
 # ==================== OBSERVE & FETCH VINTED ====================
-async def get_vinted_cookie(session, domain="at"):
-    if domain in vinted_cookies:
-        return vinted_cookies[domain]
+async def get_vinted_session(session, domain="at"):
+    if domain in vinted_session_data:
+        return vinted_session_data[domain]
     
     url = f"https://www.vinted.{domain}"
+    user_agent = random.choice(USER_AGENTS)
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5"
     }
     try:
-        async with session.get(url, headers=headers, timeout=5) as resp:
+        async with session.get(url, headers=headers, timeout=8) as resp:
             cookies = resp.cookies
-            vinted_cookies[domain] = cookies
-            return cookies
+            text = await resp.text()
+            
+            # Шукаємо access token у вихідному коді сторінки Vinted
+            token_match = re.search(r'"accessToken":"([^"]+)"', text)
+            access_token = token_match.group(1) if token_match else None
+
+            vinted_session_data[domain] = {
+                "cookies": cookies,
+                "token": access_token,
+                "user_agent": user_agent
+            }
+            return vinted_session_data[domain]
     except Exception as e:
-        logging.error(f"Error fetching cookies for domain {domain}: {e}")
+        logging.error(f"Error fetching session/cookies for domain {domain}: {e}")
         return None
 
 async def fetch_vinted_items(session, domain="at"):
-    cookies = await get_vinted_cookie(session, domain)
+    sess_data = await get_vinted_session(session, domain)
+    if not sess_data:
+        return []
+
     url = f"https://www.vinted.{domain}/api/v2/catalog/items?order=newest_first&per_page=30"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*"
+        "User-Agent": sess_data["user_agent"],
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": f"https://www.vinted.{domain}/catalog"
     }
+    
+    if sess_data.get("token"):
+        headers["Authorization"] = f"Bearer {sess_data['token']}"
+
     try:
-        async with session.get(url, headers=headers, cookies=cookies, timeout=5) as resp:
+        async with session.get(url, headers=headers, cookies=sess_data["cookies"], timeout=8) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 return data.get("items", [])
-            elif resp.status == 401: # Cookie expired
-                vinted_cookies.pop(domain, None)
+            elif resp.status in [401, 403]: # Оновлюємо сесію, якщо термін дії вичерпано
+                vinted_session_data.pop(domain, None)
     except Exception as e:
         logging.error(f"Error fetching items from Vinted ({domain}): {e}")
     return []
@@ -414,7 +442,7 @@ async def process_and_notify_items(session, items, domain):
         price_amount = float(item.get("price", 0))
         currency = item.get("currency", "EUR")
         
-        # Конвертуємо приблизно в UAH
+        # Конвертуємо в UAH
         price_uah = round(price_amount * EUR_TO_UAH_RATE)
         
         brand_title = item.get("brand_title", "Unbranded")
@@ -494,8 +522,9 @@ async def vinted_monitor_loop(session):
 
             for dom in domains_to_check:
                 items = await fetch_vinted_items(session, domain=dom)
-                await process_and_notify_items(session, items, dom)
-                await asyncio.sleep(0.5)
+                if items:
+                    await process_and_notify_items(session, items, dom)
+                await asyncio.sleep(1.0)
 
         except Exception as e:
             logging.error(f"Error in monitor loop: {e}")
@@ -795,8 +824,8 @@ async def handle_update(session, update):
                     await send_telegram_message(
                         session, 
                         chat_id, 
-                        f"⚠️ **Бренд *{existing_name}* вже є у вашому списку!**", 
-                        await get_brand_management_keyboard(chat_id)
+                        f"❌ Бренд *{brand_name_candidate}* вже є у вашому списку!", 
+                        await get_main_keyboard(chat_id)
                     )
                     return
 
@@ -805,176 +834,166 @@ async def handle_update(session, update):
             await send_telegram_message(
                 session, 
                 chat_id, 
-                f"🏷 Бренд: *{brand_name_candidate}*\n\nТепер напишіть **максимальну ціну** для цього бренду цифрами (наприклад: `75`):"
+                f"Введіть **максимальну ціну** в EUR для бренду *{brand_name_candidate}* (наприклад: `50` або `0` / `безліміт` для відсутності обмежень):"
             )
             return
 
         if state == "waiting_step2_brand_price":
             brand_name = temp_brand_storage.get(chat_id, "")
-            price_digits = re.findall(r"\d+(?:\.\d+)?", text.replace(",", "."))
-            if not price_digits:
-                await send_telegram_message(session, chat_id, "❌ **Введіть суму цифрами!** (наприклад: `75`) ")
-                return
+            price_val = float("inf")
 
-            max_price = float(price_digits[0])
+            if not any(kw in text.lower() for kw in ["безліміт", "безлимит", "0", "no"]):
+                price_digits = re.findall(r"\d+(?:\.\d+)?", text.replace(",", "."))
+                if price_digits:
+                    price_val = float(price_digits[0])
+                else:
+                    await send_telegram_message(
+                        session, 
+                        chat_id, 
+                        "❌ **Некоректна ціна!** Напишіть число або `безліміт`:"
+                    )
+                    return
+
             user_states[chat_id] = None
             temp_brand_storage.pop(chat_id, None)
 
             cfg = await get_user_settings(chat_id)
             brands = cfg.get("brands", [])
-
-            updated = False
-            for b in brands:
-                if isinstance(b, dict) and b.get("name", "").lower() == brand_name.lower():
-                    b["max_price"] = max_price
-                    updated = True
-                    break
-
-            if not updated:
-                brands.append({"name": brand_name, "max_price": max_price})
-
+            brands.append({"name": brand_name, "max_price": price_val})
             cfg["brands"] = brands
             await save_user_settings(chat_id, cfg)
+
+            p_str = f"{price_val} EUR" if price_val != float("inf") else "Безліміт"
             await send_telegram_message(
                 session, 
                 chat_id, 
-                f"✅ **Успішно збережено!**\n\n🏷 Бренд: *{brand_name}*\n💵 Макс. ціна: *{max_price} EUR*", 
+                f"✅ **Бренд додано!**\n🏷 Назва: *{brand_name}*\n💵 Макс. ціна: *{p_str}*", 
                 await get_main_keyboard(chat_id)
             )
             return
 
-        if state == "waiting_for_key" or text.startswith("VINTED-"):
+        # --- АКТИВАЦІЯ КЛЮЧІВ ТА МЕНЮ ---
+        if text in ["🔑 Активувати ключ", "🔑 Активація / Стан ключа"]:
+            time_left = await get_key_remaining_time(chat_id)
+            status_str = f"⏳ **Залишок підписки:** {time_left}\n\n" if time_left else "❌ **У вас немає активної підписки.**\n\n"
+            user_states[chat_id] = "waiting_key_input"
+            await send_telegram_message(session, chat_id, f"{status_str}Введіть ваш ключ доступу:")
+            return
+
+        if state == "waiting_key_input":
             user_states[chat_id] = None
-            days_to_add = None
-            key_doc = await get_key_data(text)
+            key_code = text.strip()
 
-            if text in MASTER_KEYS:
-                days_to_add = MASTER_KEYS[text]
-            elif key_doc and not key_doc.get("is_used"):
-                days_to_add = key_doc.get("duration_days")
-
-            if days_to_add:
-                exp_date = datetime.now() + timedelta(days=days_to_add)
-                exp_str = exp_date.strftime("%Y-%m-%d %H:%M:%S")
-
-                updated_key_data = {
-                    "duration_days": days_to_add,
+            # Перевірка Master-ключів
+            if key_code in MASTER_KEYS:
+                days = MASTER_KEYS[key_code]
+                exp_date = datetime.now() + timedelta(days=days)
+                await save_key_data(key_code, {
+                    "duration_days": days,
                     "is_used": True,
                     "used_by": chat_id,
-                    "expires_at": exp_str
-                }
-                await save_key_data(text, updated_key_data)
-                await send_telegram_message(session, chat_id, f"🎉 **Ключ успішно активовано на {days_to_add} днів!**", await get_main_keyboard(chat_id))
+                    "expires_at": exp_date.strftime("%Y-%m-%d %H:%M:%S")
+                })
+                await send_telegram_message(session, chat_id, f"🎉 **Ключ успішно активовано!**\nВам надано доступ на *{days} днів*.", await get_main_keyboard(chat_id))
+                return
+
+            key_data = await get_key_data(key_code)
+            if key_data and not key_data.get("is_used"):
+                days = key_data.get("duration_days", 30)
+                exp_date = datetime.now() + timedelta(days=days)
+                key_data["is_used"] = True
+                key_data["used_by"] = chat_id
+                key_data["expires_at"] = exp_date.strftime("%Y-%m-%d %H:%M:%S")
+                await save_key_data(key_code, key_data)
+                await send_telegram_message(session, chat_id, f"🎉 **Ключ успішно активовано!**\nВам надано доступ на *{days} днів*.", await get_main_keyboard(chat_id))
             else:
-                await send_telegram_message(session, chat_id, "❌ **Невірний або вже використаний ключ.**", await get_main_keyboard(chat_id))
+                await send_telegram_message(session, chat_id, "❌ **Недійсний або вже використаний ключ!**", await get_main_keyboard(chat_id))
             return
 
-        if text in ["🔑 Активувати ключ", "🔑 Активація / Стан ключа", "🔑 Активувати новий ключ"]:
-            time_left = await get_key_remaining_time(chat_id)
-            if time_left:
-                await send_telegram_message(
-                    session, 
-                    chat_id, 
-                    f"✅ **Ваш ключ активний!**\n⏱ Залишилося: *{time_left}*\n\nЯкщо ви хочете ввести новий ключ, надішліть його у відповідь:", 
-                    await get_main_keyboard(chat_id)
-                )
-            else:
-                user_states[chat_id] = "waiting_for_key"
-                await send_telegram_message(session, chat_id, "Надішліть ваш ключ активації у відповідь:")
+        if text == "📏 Налаштувати розміри":
+            await send_telegram_message(session, chat_id, "📏 **Оберіть потрібні розміри:**", await get_sizes_panel_keyboard(chat_id))
             return
 
-        if not await is_user_active(chat_id):
-            await send_telegram_message(session, chat_id, "🔒 **Доступ обмежено!** Натисніть кнопку активації ключа.", await get_main_keyboard(chat_id))
-            return
-
-        elif text == "🖼 Пошук за фото":
-            await send_telegram_message(session, chat_id, "📸 **Просто надішліть фотографію або скріншот речі в цей чат!**")
-
-        elif text == "🏷 Стан товару":
-            await send_telegram_message(session, chat_id, "Оберіть стан товарів для пошуку:", await get_condition_panel_keyboard(chat_id))
-
-        elif text == "📏 Налаштувати розміри":
-            await send_telegram_message(session, chat_id, "Оберіть розміри на нижній панелі:", await get_sizes_panel_keyboard(chat_id))
-
-        elif text == "🧹 Очистити розміри":
+        if text == "🧹 Очистити розміри":
             cfg = await get_user_settings(chat_id)
             cfg["sizes"] = []
             await save_user_settings(chat_id, cfg)
-            await send_telegram_message(session, chat_id, "🧹 Розміри скинуто (шукаємо всі розміри).", await get_main_keyboard(chat_id))
+            await send_telegram_message(session, chat_id, "🧹 **Список розмірів очищено!**", await get_sizes_panel_keyboard(chat_id))
+            return
 
-        elif text == "🌍 Обрати регіон":
-            await send_telegram_message(session, chat_id, "Оберіть країну з панелі нижче:", await get_region_panel_keyboard(chat_id))
+        if text == "🏷 Стан товару":
+            await send_telegram_message(session, chat_id, "🏷 **Оберіть бажаний стан товару:**", await get_condition_panel_keyboard(chat_id))
+            return
 
-        elif text == "📋 Мої налаштування":
+        if text == "🌍 Обрати регіон":
+            await send_telegram_message(session, chat_id, "🌍 **Оберіть країну для пошуку:**", await get_region_panel_keyboard(chat_id))
+            return
+
+        if text == "📋 Мої налаштування":
             cfg = await get_user_settings(chat_id)
-            raw_brands = cfg.get("brands", [])
-            
-            formatted_brands = []
-            for b in raw_brands:
-                if isinstance(b, dict):
-                    formatted_brands.append(f"{b.get('name')} (до {b.get('max_price')} EUR)")
-                else:
-                    formatted_brands.append(str(b))
+            b_list = cfg.get("brands", [])
+            brands_fmt = []
+            for b in b_list:
+                b_n = b.get("name") if isinstance(b, dict) else str(b)
+                b_p = f"{b.get('max_price')} EUR" if isinstance(b, dict) and b.get("max_price") != float("inf") else "Безліміт"
+                brands_fmt.append(f"• {b_n} (до {b_p})")
 
-            brands_str = "\n• " + "\n• ".join(formatted_brands) if formatted_brands else "Пошук ВСІХ нових речей поспіль!"
-            sizes = ", ".join(cfg.get("sizes", [])) or "Всі розміри"
-            domain = cfg.get("domain", "at").upper()
-            status = "🟢 Активний" if cfg.get("active") else "🔴 Зупинений"
-            
-            cond_map = {"all": "🌐 Усі речі", "new": "✨ Тільки Нові", "used": "🔄 Тільки Б/У"}
-            condition_str = cond_map.get(cfg.get("condition", "all"), "Усі речі")
+            b_str = "\n".join(brands_fmt) if brands_fmt else "Всі бренди (не вказано)"
+            s_str = ", ".join(cfg.get("sizes", [])) if cfg.get("sizes") else "Усі розміри"
+            reg = cfg.get("domain", "at").upper()
+            cond_map = {"all": "Усі (Б/У + Нові)", "new": "Тільки Нові", "used": "Тільки Б/У"}
+            cond_str = cond_map.get(cfg.get("condition", "all"), "Усі")
+            st_str = "🟢 Активний" if cfg.get("active") else "🔴 Зупинений"
 
-            msg_text = (
-                f"📋 **Ваші поточні налаштування:**\n\n"
-                f"Статус пошуку: *{status}*\n"
-                f"Регіон: *{domain}*\n"
-                f"Стан: *{condition_str}*\n"
-                f"Розміри: *{sizes}*\n\n"
-                f"🏷 **Відстежувані бренди:**{brands_str}"
+            info_msg = (
+                f"⚙️ **Ваші поточні налаштування:**\n\n"
+                f"📊 **Статус пошуку:** {st_str}\n"
+                f"🌍 **Регіон:** {reg}\n"
+                f"🏷 **Стан:** {cond_str}\n"
+                f"📏 **Розміри:** {s_str}\n\n"
+                f"📋 **Відстежувані бренди:**\n{b_str}"
             )
-            await send_telegram_message(session, chat_id, msg_text, await get_main_keyboard(chat_id))
+            await send_telegram_message(session, chat_id, info_msg, await get_main_keyboard(chat_id))
+            return
 
-        else:
-            await send_telegram_message(session, chat_id, "⚙️ Скористайтеся меню нижче:", await get_main_keyboard(chat_id))
+        if text == "🛒 Придбати ключ":
+            await send_telegram_message(session, chat_id, f"🛒 Для придбання ключа зверніться до адміністратора: tg://user?id={ADMIN_ID}")
+            return
 
-# ==================== СЕРВЕР ТА LONG POLLING ====================
+# ==================== MAIN TELEGRAM BOT LOOP ====================
 async def telegram_polling_loop(session):
     global last_update_id
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
     while True:
         try:
             params = {"offset": last_update_id + 1, "timeout": 10}
-            async with session.get(url, params=params, timeout=12) as resp:
+            async with session.get(url, params=params, timeout=15) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     for update in data.get("result", []):
-                        last_update_id = update["update_id"]
+                        last_update_id = max(last_update_id, update["update_id"])
                         asyncio.create_task(handle_update(session, update))
         except Exception as e:
-            logging.error(f"Polling error: {e}")
-        await asyncio.sleep(0.5)
+            logging.error(f"Error in Telegram polling: {e}")
+        await asyncio.sleep(1)
 
-async def start_background_tasks(app):
+# ==================== MAIN APPLICATION STARTUP ====================
+async def main():
     await init_db_indexes()
-    app['http_session'] = aiohttp.ClientSession()
-    app['polling_task'] = asyncio.create_task(telegram_polling_loop(app['http_session']))
-    app['vinted_task'] = asyncio.create_task(vinted_monitor_loop(app['http_session']))
+    async with aiohttp.ClientSession() as session:
+        app = web.Application()
+        app.router.add_get('/', health_check)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        port = int(os.environ.get("PORT", 8080))
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        logging.info(f"Health check server running on port {port}")
 
-async def cleanup_background_tasks(app):
-    app['polling_task'].cancel()
-    app['vinted_task'].cancel()
-    await app['http_session'].close()
-
-def main():
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    app.router.add_get("/health", health_check)
-
-    app.on_startup.append(start_background_tasks)
-    app.on_cleanup.append(cleanup_background_tasks)
-
-    port = int(os.environ.get("PORT", 8080))
-    web.run_app(app, host="0.0.0.0", port=port)
+        await asyncio.gather(
+            telegram_polling_loop(session),
+            vinted_monitor_loop(session)
+        )
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
