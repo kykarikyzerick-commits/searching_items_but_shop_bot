@@ -19,7 +19,7 @@ ADMIN_ID = 8138110821
 
 MONGO_URI = "mongodb+srv://kykarikyzerick_db_user:CVz4czwK06sgQlSP@cluster0.xuoxdku.mongodb.net/?appName=Cluster0"
 
-CHECK_INTERVAL = 1.5  # Інтервал між запитами
+CHECK_INTERVAL = 0.5  # Прискорений інтервал опитування
 ALLOWED_USERS = [8138110821]
 EUR_TO_UAH_RATE = 51.0
 
@@ -347,7 +347,7 @@ async def send_telegram_photo(session, chat_id, photo_url, caption, reply_markup
     except Exception as e:
         logging.error(f"Telegram Photo Error: {e}")
 
-# ==================== VINTED API ====================
+# ==================== VINTED API (ОПТИМІЗОВАНО НА 90 ТОВАРІВ) ====================
 async def refresh_vinted_session(session, domain="at"):
     url = f"https://www.vinted.{domain}"
     user_agent = random.choice(USER_AGENTS)
@@ -386,7 +386,8 @@ async def fetch_vinted_items(session, domain="at"):
     if not sess:
         return []
 
-    url = f"https://www.vinted.{domain}/api/v2/catalog/items?order=newest_first&per_page=30"
+    # Отримання 90 найновіших речей замість 30
+    url = f"https://www.vinted.{domain}/api/v2/catalog/items?order=newest_first&per_page=90"
     headers = {
         "User-Agent": sess["user_agent"],
         "Accept": "application/json, text/plain, */*",
@@ -411,7 +412,7 @@ async def fetch_vinted_items(session, domain="at"):
         logging.error(f"Error fetching from Vinted [{domain}]: {e}")
     return []
 
-# ==================== РОЗСИЛКА ЗНАХІДОК (ВИПРАВЛЕНО ТИПИ ЦІНИ) ====================
+# ==================== РОЗСИЛКА ЗНАХІДОК ====================
 async def process_and_notify_items(session, items, domain):
     if not items:
         return
@@ -533,7 +534,7 @@ async def vinted_monitor_loop(session):
                 items = await fetch_vinted_items(session, domain=dom)
                 if items:
                     await process_and_notify_items(session, items, dom)
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.2)
 
         except Exception as e:
             logging.error(f"Error in monitor loop: {e}")
