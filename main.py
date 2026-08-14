@@ -23,6 +23,9 @@ CHECK_INTERVAL = 0.1
 ALLOWED_USERS = [8138110821]
 EUR_TO_UAH_RATE = 51.0
 
+# МАКСИМАЛЬНИЙ ВІК ТОВАРУ: 30 хвилин (30 * 60 = 1800 секунд)
+MAX_ITEM_AGE_SECONDS = 1800  
+
 MASTER_KEYS = {
     "VINTED-VIP-2026": 365,
     "VINTED-FREE-TEST": 30,
@@ -85,7 +88,7 @@ seen_items_collection = db["seen_items"]
 
 user_states = {}
 temp_brand_storage = {}
-active_users_cache = {}  # КЕШ СТАТУСУ АКТИВНОСТІ ЮЗЕРІВ
+active_users_cache = {}  
 seen_items_cache = set()  
 last_update_id = 0
 vinted_session_data = {} 
@@ -383,7 +386,7 @@ async def fetch_vinted_brand_items(session, domain="at", brand_query=None):
         return []
 
     if brand_query:
-        url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={brand_query}&order=newest_first&per_page=15"
+        url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={brand_query}&order=newest_first&per_page=20"
     else:
         url = f"https://www.vinted.{domain}/api/v2/catalog/items?order=newest_first&per_page=20"
 
@@ -407,7 +410,7 @@ async def fetch_vinted_brand_items(session, domain="at", brand_query=None):
         pass
     return []
 
-# ==================== МОМЕНТАЛЬНА ТА КУРОВАНА РОЗСИЛКА ====================
+# ==================== МОМЕНТАЛЬНА ТА ЧАСОВО ФІЛЬТРОВАНА РОЗСИЛКА ====================
 async def process_and_notify_items(session, items, domain):
     if not items:
         return
@@ -418,10 +421,23 @@ async def process_and_notify_items(session, items, domain):
     if not active_users:
         return
 
+    now_ts = time.time()
+
     for item in items:
         item_id = item.get("id")
         if not item_id or is_item_seen_fast(item_id):
             continue
+
+        # ----------------- ЧАСОВИЙ ФІЛЬТР (НЕ СТАРІШЕ 30 ХВИЛИН) -----------------
+        created_at_ts = item.get("created_at_ts")
+        if created_at_ts:
+            if created_at_ts > 1000000000000:  # якщо часовий штамп у мілісекундах
+                created_at_ts /= 1000.0
+
+            age = now_ts - created_at_ts
+            if age > MAX_ITEM_AGE_SECONDS:  # Пропускаємо речі, які старіші за 30 хвилин
+                await mark_item_seen(item_id)
+                continue
 
         title = item.get("title", "")
         description = item.get("description", "") or ""
@@ -459,7 +475,6 @@ async def process_and_notify_items(session, items, domain):
         for user in active_users:
             user_id = int(user.get("user_id"))
 
-            # ЖОРСТКА ПЕРЕВІРКА: Якщо натиснуто КНОПКУ СТОП, НЕ ВІДПРАВЛЯТИ НІЧОГО!
             if not active_users_cache.get(user_id, False):
                 continue
 
@@ -518,7 +533,6 @@ async def vinted_monitor_loop(session):
             cursor = settings_collection.find({"active": True})
             active_users = await cursor.to_list(length=1000)
 
-            # Перевіряємо, чи є хоч один активний юзер
             if any(active_users_cache.get(int(u.get("user_id")), False) for u in active_users):
                 tasks = []
                 for user in active_users:
@@ -537,7 +551,6 @@ async def vinted_monitor_loop(session):
                         tasks.append((dom, None))
 
                 for dom, b_name in tasks:
-                    # Почерговий миттєвий запит по брендах
                     items = await fetch_vinted_brand_items(session, domain=dom, brand_query=b_name)
                     if items:
                         await process_and_notify_items(session, items, dom)
@@ -598,7 +611,6 @@ async def handle_update(session, update):
         state = user_states.get(chat_id)
 
         if text == "⏹ Зупинити":
-            # МИТТЄВО міняємо стан у локальному кеші
             active_users_cache[chat_id] = False
             cfg = await get_user_settings(chat_id)
             cfg["active"] = False
