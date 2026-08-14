@@ -19,7 +19,7 @@ ADMIN_ID = 8138110821
 
 MONGO_URI = "mongodb+srv://kykarikyzerick_db_user:CVz4czwK06sgQlSP@cluster0.xuoxdku.mongodb.net/?appName=Cluster0"
 
-CHECK_INTERVAL = 0.1  # Мінімальна затримка для ультра-швидкого моніторингу
+CHECK_INTERVAL = 0.1
 ALLOWED_USERS = [8138110821]
 EUR_TO_UAH_RATE = 51.0
 
@@ -85,7 +85,7 @@ seen_items_collection = db["seen_items"]
 
 user_states = {}
 temp_brand_storage = {}
-active_users_cache = {}  
+active_users_cache = {}  # КЕШ СТАТУСУ АКТИВНОСТІ ЮЗЕРІВ
 seen_items_cache = set()  
 last_update_id = 0
 vinted_session_data = {} 
@@ -345,7 +345,7 @@ async def send_telegram_photo(session, chat_id, photo_url, caption, reply_markup
     except Exception as e:
         logging.error(f"Telegram Photo Error: {e}")
 
-# ==================== VINTED API (TARGETED PARALLEL SEARCH) ====================
+# ==================== VINTED API (TARGETED SEARCH) ====================
 async def refresh_vinted_session(session, domain="at"):
     url = f"https://www.vinted.{domain}"
     user_agent = random.choice(USER_AGENTS)
@@ -382,11 +382,10 @@ async def fetch_vinted_brand_items(session, domain="at", brand_query=None):
     if not sess:
         return []
 
-    # Точковий пошук прямо за назвою бренду
     if brand_query:
-        url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={brand_query}&order=newest_first&per_page=30"
+        url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={brand_query}&order=newest_first&per_page=15"
     else:
-        url = f"https://www.vinted.{domain}/api/v2/catalog/items?order=newest_first&per_page=50"
+        url = f"https://www.vinted.{domain}/api/v2/catalog/items?order=newest_first&per_page=20"
 
     headers = {
         "User-Agent": sess["user_agent"],
@@ -408,7 +407,7 @@ async def fetch_vinted_brand_items(session, domain="at", brand_query=None):
         pass
     return []
 
-# ==================== МИТТЄВА РОЗСИЛКА ====================
+# ==================== МОМЕНТАЛЬНА ТА КУРОВАНА РОЗСИЛКА ====================
 async def process_and_notify_items(session, items, domain):
     if not items:
         return
@@ -459,7 +458,11 @@ async def process_and_notify_items(session, items, domain):
 
         for user in active_users:
             user_id = int(user.get("user_id"))
-            
+
+            # ЖОРСТКА ПЕРЕВІРКА: Якщо натиснуто КНОПКУ СТОП, НЕ ВІДПРАВЛЯТИ НІЧОГО!
+            if not active_users_cache.get(user_id, False):
+                continue
+
             if not await is_user_active(user_id):
                 continue
 
@@ -498,14 +501,14 @@ async def process_and_notify_items(session, items, domain):
 
             if matched:
                 caption = (
-                    f"⚡️ **НОВИЙ ТОВАР МОМЕНТАЛЬНО!** ⚡️\n\n"
+                    f"⚡️ **НОВИЙ ТОВАР!** ⚡️\n\n"
                     f"📌 **Назва:** {title}\n"
                     f"🏷 **Бренд:** {brand_title}\n"
                     f"📏 **Розмір:** {size_title}\n"
                     f"💰 **Ціна:** {price_amount} {currency} (~{price_uah} UAH)\n"
                     f"✨ **Стан:** {'Новий' if is_new else 'Б/У'}\n"
                 )
-                asyncio.create_task(send_telegram_photo(session, user_id, photo_url, caption, get_item_keyboard(item_url)))
+                await send_telegram_photo(session, user_id, photo_url, caption, get_item_keyboard(item_url))
 
         await mark_item_seen(item_id)
 
@@ -515,26 +518,29 @@ async def vinted_monitor_loop(session):
             cursor = settings_collection.find({"active": True})
             active_users = await cursor.to_list(length=1000)
 
-            # Збираємо всі бренди та домени активних юзерів
-            tasks = []
-            for user in active_users:
-                dom = user.get("domain", "at")
-                user_brands = user.get("brands", [])
-                
-                if user_brands:
-                    for b in user_brands:
-                        b_name = b.get("name") if isinstance(b, dict) else str(b)
-                        tasks.append(fetch_vinted_brand_items(session, domain=dom, brand_query=b_name))
-                else:
-                    tasks.append(fetch_vinted_brand_items(session, domain=dom, brand_query=None))
+            # Перевіряємо, чи є хоч один активний юзер
+            if any(active_users_cache.get(int(u.get("user_id")), False) for u in active_users):
+                tasks = []
+                for user in active_users:
+                    u_id = int(user.get("user_id"))
+                    if not active_users_cache.get(u_id, False):
+                        continue
 
-            if tasks:
-                # Виконуємо паралельні запити
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for res in results:
-                    if isinstance(res, list) and res:
-                        # Запускаємо надсилання миттєво без очікування
-                        asyncio.create_task(process_and_notify_items(session, res, "at"))
+                    dom = user.get("domain", "at")
+                    user_brands = user.get("brands", [])
+                    
+                    if user_brands:
+                        for b in user_brands:
+                            b_name = b.get("name") if isinstance(b, dict) else str(b)
+                            tasks.append((dom, b_name))
+                    else:
+                        tasks.append((dom, None))
+
+                for dom, b_name in tasks:
+                    # Почерговий миттєвий запит по брендах
+                    items = await fetch_vinted_brand_items(session, domain=dom, brand_query=b_name)
+                    if items:
+                        await process_and_notify_items(session, items, dom)
 
         except Exception as e:
             logging.error(f"Error in monitor loop: {e}")
@@ -592,17 +598,18 @@ async def handle_update(session, update):
         state = user_states.get(chat_id)
 
         if text == "⏹ Зупинити":
+            # МИТТЄВО міняємо стан у локальному кеші
+            active_users_cache[chat_id] = False
             cfg = await get_user_settings(chat_id)
             cfg["active"] = False
-            active_users_cache[chat_id] = False
             await save_user_settings(chat_id, cfg)
             await send_telegram_message(session, chat_id, "⏹ **Пошук повністю зупинено!**", await get_main_keyboard(chat_id))
             return
 
         if text == "▶️ Запустити":
+            active_users_cache[chat_id] = True
             cfg = await get_user_settings(chat_id)
             cfg["active"] = True
-            active_users_cache[chat_id] = True
             await save_user_settings(chat_id, cfg)
             await send_telegram_message(session, chat_id, "🚀 **Пошук речей запущено!**", await get_main_keyboard(chat_id))
             return
@@ -786,7 +793,6 @@ async def handle_update(session, update):
         if state == "waiting_new_name_only":
             old_data = temp_brand_storage.get(chat_id, {})
             old_name = old_data.get("old_name")
-            curr_price = old_data.get("price")
             new_name = text.strip()
 
             if not is_valid_brand_name(new_name):
