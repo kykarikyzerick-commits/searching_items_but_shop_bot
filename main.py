@@ -24,6 +24,15 @@ ALLOWED_USERS = [8138110821]
 EUR_TO_UAH_RATE = 51.0
 MAX_ITEM_AGE_SECONDS = 1800  
 
+# Курси валют відносно EUR для точного розрахунку макс. ціни
+RATES_TO_EUR = {
+    "EUR": 1.0,
+    "PLN": 0.23,  # 1 PLN ~ 0.23 EUR
+    "CZK": 0.040, # 1 CZK ~ 0.04 EUR
+    "RON": 0.20,  # 1 RON ~ 0.20 EUR
+    "GBP": 1.17   # 1 GBP ~ 1.17 EUR
+}
+
 MASTER_KEYS = {
     "VINTED-VIP-2026": 365,
     "VINTED-FREE-TEST": 30,
@@ -48,9 +57,9 @@ FAKE_KEYWORDS = [
 
 DOMAINS = {
     "🇵🇱 Польща": {"code": "pl", "currency": "PLN"},
-    "🇦Т Австрія": {"code": "at", "currency": "EUR"},
+    "🇦🇹 Австрія": {"code": "at", "currency": "EUR"},
     "🇨🇿 Чехія": {"code": "cz", "currency": "CZK"},
-    "🇱Т Литва": {"code": "lt", "currency": "EUR"},
+    "🇱🇹 Литва": {"code": "lt", "currency": "EUR"},
     "🇷🇴 Румунія": {"code": "ro", "currency": "RON"},
     "🇩🇪 Німеччина": {"code": "de", "currency": "EUR"},
     "🇫🇷 Франція": {"code": "fr", "currency": "EUR"},
@@ -107,17 +116,23 @@ async def get_user_settings(user_id):
                 "user_id": uid_str,
                 "brands": [],
                 "sizes": [],
-                "domain": "at",
+                "domains": ["at"],
                 "condition": "all",
                 "active": False
             }
             await settings_collection.insert_one(doc)
         
+        if "domain" in doc and "domains" not in doc:
+            doc["domains"] = [doc["domain"]] if isinstance(doc["domain"], str) else doc["domain"]
+
+        if "domains" not in doc or not doc["domains"]:
+            doc["domains"] = ["at"]
+
         active_users_cache[int(user_id)] = doc.get("active", False)
         return doc
     except Exception as e:
         logging.error(f"DB Error in get_user_settings: {e}")
-        return {"user_id": uid_str, "brands": [], "sizes": [], "domain": "at", "condition": "all", "active": False}
+        return {"user_id": uid_str, "brands": [], "sizes": [], "domains": ["at"], "condition": "all", "active": False}
 
 async def save_user_settings(user_id, settings):
     uid_str = str(user_id)
@@ -332,11 +347,14 @@ async def get_sizes_panel_keyboard(user_id):
 
 async def get_region_panel_keyboard(user_id):
     cfg = await get_user_settings(user_id)
-    curr = cfg.get("domain", "at")
+    curr_domains = cfg.get("domains", ["at"])
+    if isinstance(curr_domains, str):
+        curr_domains = [curr_domains]
+
     kb = []
     row = []
     for name, data in DOMAINS.items():
-        prefix = "✅ " if data["code"] == curr else ""
+        prefix = "✅ " if data["code"] in curr_domains else ""
         row.append({"text": f"{prefix}{name}"})
         if len(row) == 2:
             kb.append(row)
@@ -438,7 +456,7 @@ async def fetch_vinted_brand_items(session, domain="at", brand_query=None):
         pass
     return []
 
-# ==================== ШВИДКА ОБРОБКА БЕЗ ДУБЛІВ ====================
+# ==================== ШВИДКА ОБРОБКА З КОНВЕРТАЦІЄЮ ВАЛЮТ ====================
 async def process_and_notify_items(session, items, domain, active_users):
     if not items or not active_users:
         return
@@ -482,7 +500,11 @@ async def process_and_notify_items(session, items, domain, active_users):
         if isinstance(currency, dict):
             currency = currency.get("code", "EUR")
 
-        price_uah = round(price_amount * EUR_TO_UAH_RATE)
+        # Переводимо ціну у євро для точного порівняння з максимальним лімітом користувача
+        rate_to_eur = RATES_TO_EUR.get(currency.upper(), 1.0)
+        price_in_eur = price_amount * rate_to_eur
+
+        price_uah = round(price_amount * EUR_TO_UAH_RATE) if currency == "EUR" else round(price_in_eur * EUR_TO_UAH_RATE)
         
         brand_title = item.get("brand_title", "Unbranded")
         size_title = item.get("size_title", "Не вказано")
@@ -500,8 +522,11 @@ async def process_and_notify_items(session, items, domain, active_users):
             if not active_users_cache.get(user_id, False) or not await is_user_active(user_id):
                 continue
 
-            user_domain = user.get("domain", "at")
-            if user_domain != domain:
+            user_domains = user.get("domains", ["at"])
+            if isinstance(user_domains, str):
+                user_domains = [user_domains]
+
+            if domain not in user_domains:
                 continue
 
             user_cond = user.get("condition", "all")
@@ -528,8 +553,9 @@ async def process_and_notify_items(session, items, domain, active_users):
                     except (ValueError, TypeError):
                         b_max_price = float("inf")
                     
+                    # Перевіряємо відповідність бренду та макс ціні у євро
                     if b_name in combined_text or b_name in brand_title.lower():
-                        if price_amount <= b_max_price:
+                        if price_in_eur <= b_max_price:
                             matched = True
                             break
 
@@ -539,8 +565,9 @@ async def process_and_notify_items(session, items, domain, active_users):
                     f"📌 **Назва:** {title}\n"
                     f"🏷 **Бренд:** {brand_title}\n"
                     f"📏 **Розмір:** {size_title}\n"
-                    f"💰 **Ціна:** {price_amount} {currency} (~{price_uah} UAH)\n"
+                    f"💰 **Ціна:** {price_amount} {currency} (~{round(price_in_eur, 2)} EUR / ~{price_uah} UAH)\n"
                     f"✨ **Стан:** {'Новий' if is_new else 'Б/У'}\n"
+                    f"🌍 **Регіон:** {domain.upper()}\n"
                 )
                 asyncio.create_task(send_telegram_photo(session, user_id, photo_url, caption, get_item_keyboard(item_url)))
 
@@ -562,15 +589,19 @@ async def vinted_monitor_loop(session):
                     if not active_users_cache.get(u_id, False):
                         continue
 
-                    dom = user.get("domain", "at")
+                    user_domains = user.get("domains", ["at"])
+                    if isinstance(user_domains, str):
+                        user_domains = [user_domains]
+
                     user_brands = user.get("brands", [])
                     
-                    if user_brands:
-                        for b in user_brands:
-                            b_name = b.get("name") if isinstance(b, dict) else str(b)
-                            tasks.append(fetch_and_notify(session, dom, b_name, active_users))
-                    else:
-                        tasks.append(fetch_and_notify(session, dom, None, active_users))
+                    for dom in user_domains:
+                        if user_brands:
+                            for b in user_brands:
+                                b_name = b.get("name") if isinstance(b, dict) else str(b)
+                                tasks.append(fetch_and_notify(session, dom, b_name, active_users))
+                        else:
+                            tasks.append(fetch_and_notify(session, dom, None, active_users))
 
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
@@ -737,9 +768,20 @@ async def handle_update(session, update):
         clean_reg_text = text.replace("✅ ", "")
         if clean_reg_text in DOMAINS:
             cfg = await get_user_settings(chat_id)
-            cfg["domain"] = DOMAINS[clean_reg_text]["code"]
+            code = DOMAINS[clean_reg_text]["code"]
+            curr_domains = cfg.get("domains", ["at"])
+            if isinstance(curr_domains, str):
+                curr_domains = [curr_domains]
+
+            if code in curr_domains:
+                if len(curr_domains) > 1:
+                    curr_domains.remove(code)
+            else:
+                curr_domains.append(code)
+
+            cfg["domains"] = curr_domains
             await save_user_settings(chat_id, cfg)
-            await send_telegram_message(session, chat_id, f"✅ Регіон змінено на: *{clean_reg_text}*", await get_region_panel_keyboard(chat_id))
+            await send_telegram_message(session, chat_id, "🌍 **Оновлено список країн для пошуку:**", await get_region_panel_keyboard(chat_id))
             return
 
         clean_size = text.replace("✅ ", "")
@@ -937,7 +979,7 @@ async def handle_update(session, update):
             return
 
         if text == "🌍 Обрати регіон":
-            await send_telegram_message(session, chat_id, "🌍 **Оберіть країну:**", await get_region_panel_keyboard(chat_id))
+            await send_telegram_message(session, chat_id, "🌍 **Оберіть країни (можна обрати кілька):**", await get_region_panel_keyboard(chat_id))
             return
 
         if text == "📋 Мої налаштування":
@@ -951,7 +993,12 @@ async def handle_update(session, update):
 
             b_str = "\n".join(brands_fmt) if brands_fmt else "Усі бренди"
             s_str = ", ".join(cfg.get("sizes", [])) if cfg.get("sizes") else "Усі розміри"
-            reg = cfg.get("domain", "at").upper()
+            
+            domains_list = cfg.get("domains", ["at"])
+            if isinstance(domains_list, str):
+                domains_list = [domains_list]
+            reg_str = ", ".join([d.upper() for d in domains_list])
+
             cond_map = {"all": "Усі (Б/У + Нові)", "new": "Тільки Нові", "used": "Тільки Б/У"}
             cond_str = cond_map.get(cfg.get("condition", "all"), "Усі")
             st_str = "🟢 Активний" if cfg.get("active") else "🔴 Зупинений"
@@ -959,7 +1006,7 @@ async def handle_update(session, update):
             info_msg = (
                 f"⚙️ **Поточні налаштування:**\n\n"
                 f"📊 **Статус:** {st_str}\n"
-                f"🌍 **Регіон:** {reg}\n"
+                f"🌍 **Регіони:** {reg_str}\n"
                 f"🏷 **Стан:** {cond_str}\n"
                 f"📏 **Розміри:** {s_str}\n\n"
                 f"📋 **Бренди:**\n{b_str}"
