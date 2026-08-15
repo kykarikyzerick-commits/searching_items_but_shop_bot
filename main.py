@@ -19,12 +19,9 @@ ADMIN_ID = 8138110821
 
 MONGO_URI = "mongodb+srv://kykarikyzerick_db_user:CVz4czwK06sgQlSP@cluster0.xuoxdku.mongodb.net/?appName=Cluster0"
 
-# МАКСИМАЛЬНА ШВИДКОСТЬ ПОШУКУ
 CHECK_INTERVAL = 0.05  
 ALLOWED_USERS = [8138110821]
 EUR_TO_UAH_RATE = 51.0
-
-# МАКСИМАЛЬНИЙ ВІК ТОВАРУ: 30 хвилин (1800 секунд)
 MAX_ITEM_AGE_SECONDS = 1800  
 
 MASTER_KEYS = {
@@ -88,14 +85,13 @@ seen_items_collection = db["seen_items"]
 user_states = {}
 temp_brand_storage = {}
 active_users_cache = {}  
-seen_items_cache = set()  # ШВИДКИЙ КЕШ В ОПЕРАТИВНІЙ ПАМ'ЯТІ
+seen_items_cache = set()
 vinted_session_data = {} 
 processed_updates = set()
 
 async def init_db_indexes():
     try:
         await seen_items_collection.create_index("item_id", unique=True)
-        # Завантажуємо останні 20,000 збережених товарів в RAM при старті
         async for doc in seen_items_collection.find().sort("_id", -1).limit(20000):
             seen_items_cache.add(str(doc.get("item_id")))
         logging.info(f"Завантажено {len(seen_items_cache)} товарів у RAM кеш.")
@@ -156,13 +152,11 @@ def mark_item_seen_and_save(item_id):
     item_str = str(item_id)
     seen_items_cache.add(item_str)
     
-    # Контроль розміру оперативної пам'яті
     if len(seen_items_cache) > 50000:
         items_to_remove = list(seen_items_cache)[:10000]
         for k in items_to_remove:
             seen_items_cache.discard(k)
 
-    # Фоновий запис в БД (без затримки для бота)
     asyncio.create_task(save_item_to_db(item_str))
 
 async def get_key_data(key_code):
@@ -454,11 +448,9 @@ async def process_and_notify_items(session, items, domain, active_users):
     for item in items:
         item_id = item.get("id")
         
-        # 1. МИТТЄВА ПЕРЕВІРКА І ЗАХИСТ ВІД ДУБЛІКАТІВ
         if not item_id or is_item_seen_fast(item_id):
             continue
 
-        # Враховуючи, що товар унікальний, ВІДРАЗУ позначаємо його переглянутим
         mark_item_seen_and_save(item_id)
 
         created_at_ts = item.get("created_at_ts")
@@ -981,7 +973,7 @@ async def handle_update(session, update):
 
 # ==================== MAIN LOOP ====================
 async def telegram_polling_loop(session):
-    global last_update_id
+    last_update_id = 0
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
     while True:
         try:
