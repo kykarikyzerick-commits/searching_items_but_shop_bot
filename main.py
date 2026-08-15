@@ -19,11 +19,12 @@ ADMIN_ID = 8138110821
 
 MONGO_URI = "mongodb+srv://kykarikyzerick_db_user:CVz4czwK06sgQlSP@cluster0.xuoxdku.mongodb.net/?appName=Cluster0"
 
-CHECK_INTERVAL = 0.1
+# БЕЗПЕЧНИЙ ІНТЕРВАЛ (3 секунди між колами пошуку для запобігання бана IP)
+CHECK_INTERVAL = 3.0  
 ALLOWED_USERS = [8138110821]
 EUR_TO_UAH_RATE = 51.0
 
-# МАКСИМАЛЬНИЙ ВІК ТОВАРУ: 30 хвилин (30 * 60 = 1800 секунд)
+# МАКСИМАЛЬНИЙ ВІК ТОВАРУ: 30 хвилин (1800 секунд)
 MAX_ITEM_AGE_SECONDS = 1800  
 
 MASTER_KEYS = {
@@ -60,9 +61,9 @@ DOMAINS = {
 }
 
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 ]
 
 # ==================== ВАЛІДАЦІЯ ====================
@@ -95,26 +96,33 @@ vinted_session_data = {}
 processed_updates = set()
 
 async def init_db_indexes():
-    await seen_items_collection.create_index("item_id", unique=True)
-    async for doc in seen_items_collection.find().sort("_id", -1).limit(5000):
-        seen_items_cache.add(str(doc.get("item_id")))
+    try:
+        await seen_items_collection.create_index("item_id", unique=True)
+        async for doc in seen_items_collection.find().sort("_id", -1).limit(5000):
+            seen_items_cache.add(str(doc.get("item_id")))
+    except Exception as e:
+        logging.error(f"Error initializing DB indexes: {e}")
 
 async def get_user_settings(user_id):
     uid_str = str(user_id)
-    doc = await settings_collection.find_one({"user_id": uid_str})
-    if not doc:
-        doc = {
-            "user_id": uid_str,
-            "brands": [],
-            "sizes": [],
-            "domain": "at",
-            "condition": "all",
-            "active": False
-        }
-        await settings_collection.insert_one(doc)
-    
-    active_users_cache[int(user_id)] = doc.get("active", False)
-    return doc
+    try:
+        doc = await settings_collection.find_one({"user_id": uid_str})
+        if not doc:
+            doc = {
+                "user_id": uid_str,
+                "brands": [],
+                "sizes": [],
+                "domain": "at",
+                "condition": "all",
+                "active": False
+            }
+            await settings_collection.insert_one(doc)
+        
+        active_users_cache[int(user_id)] = doc.get("active", False)
+        return doc
+    except Exception as e:
+        logging.error(f"DB Error in get_user_settings: {e}")
+        return {"user_id": uid_str, "brands": [], "sizes": [], "domain": "at", "condition": "all", "active": False}
 
 async def save_user_settings(user_id, settings):
     uid_str = str(user_id)
@@ -122,11 +130,14 @@ async def save_user_settings(user_id, settings):
     if "active" in settings:
         active_users_cache[int(user_id)] = settings["active"]
 
-    await settings_collection.update_one(
-        {"user_id": uid_str},
-        {"$set": settings},
-        upsert=True
-    )
+    try:
+        await settings_collection.update_one(
+            {"user_id": uid_str},
+            {"$set": settings},
+            upsert=True
+        )
+    except Exception as e:
+        logging.error(f"DB Error in save_user_settings: {e}")
 
 def is_item_seen_fast(item_id):
     return str(item_id) in seen_items_cache
@@ -134,8 +145,13 @@ def is_item_seen_fast(item_id):
 async def mark_item_seen(item_id):
     item_str = str(item_id)
     seen_items_cache.add(item_str)
+    
+    # Розумне очищення: видаляємо найстаріші 3000 елементів при перевищенні ліміту
     if len(seen_items_cache) > 15000:
-        seen_items_cache.clear()
+        items_to_remove = list(seen_items_cache)[:3000]
+        for k in items_to_remove:
+            seen_items_cache.discard(k)
+
     try:
         await seen_items_collection.update_one(
             {"item_id": item_str},
@@ -146,15 +162,22 @@ async def mark_item_seen(item_id):
         pass
 
 async def get_key_data(key_code):
-    return await keys_collection.find_one({"key": key_code})
+    try:
+        return await keys_collection.find_one({"key": key_code})
+    except Exception as e:
+        logging.error(f"DB Error in get_key_data: {e}")
+        return None
 
 async def save_key_data(key_code, data):
     data["key"] = key_code
-    await keys_collection.update_one(
-        {"key": key_code},
-        {"$set": data},
-        upsert=True
-    )
+    try:
+        await keys_collection.update_one(
+            {"key": key_code},
+            {"$set": data},
+            upsert=True
+        )
+    except Exception as e:
+        logging.error(f"DB Error in save_key_data: {e}")
 
 async def health_check(request):
     return web.Response(text="Bot is active")
@@ -176,16 +199,20 @@ async def is_user_active(user_id):
         return True
 
     now = datetime.now()
-    cursor = keys_collection.find({"used_by": user_id, "is_used": True})
-    async for data in cursor:
-        exp_str = data.get("expires_at")
-        if exp_str:
-            try:
-                exp_date = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S")
-                if exp_date > now:
-                    return True
-            except Exception:
-                continue
+    try:
+        cursor = keys_collection.find({"used_by": user_id, "is_used": True})
+        async for data in cursor:
+            exp_str = data.get("expires_at")
+            if exp_str:
+                try:
+                    exp_date = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S")
+                    if exp_date > now:
+                        return True
+                except Exception:
+                    continue
+    except Exception as e:
+        logging.error(f"DB Error in is_user_active: {e}")
+
     return False
 
 async def get_key_remaining_time(user_id):
@@ -194,21 +221,24 @@ async def get_key_remaining_time(user_id):
 
     now = datetime.now()
     latest_exp = None
-    cursor = keys_collection.find({"used_by": user_id, "is_used": True})
-    async for data in cursor:
-        exp_str = data.get("expires_at")
-        if exp_str:
-            try:
-                exp_date = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S")
-                if exp_date > now:
-                    if not latest_exp or exp_date > latest_exp:
-                        latest_exp = exp_date
-            except Exception:
-                pass
+    try:
+        cursor = keys_collection.find({"used_by": user_id, "is_used": True})
+        async for data in cursor:
+            exp_str = data.get("expires_at")
+            if exp_str:
+                try:
+                    exp_date = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S")
+                    if exp_date > now:
+                        if not latest_exp or exp_date > latest_exp:
+                            latest_exp = exp_date
+                except Exception:
+                    pass
 
-    if latest_exp:
-        diff = latest_exp - now
-        return f"{diff.days} днів, {diff.seconds // 3600} годин"
+        if latest_exp:
+            diff = latest_exp - now
+            return f"{diff.days} днів, {diff.seconds // 3600} годин"
+    except Exception as e:
+        logging.error(f"DB Error in get_key_remaining_time: {e}")
 
     return None
 
@@ -332,10 +362,10 @@ async def send_telegram_message(session, chat_id, text, reply_markup=None):
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
     try:
-        async with session.post(url, json=payload, timeout=5) as resp:
+        async with session.post(url, json=payload, timeout=8) as resp:
             return await resp.json()
     except Exception as e:
-        logging.error(f"Telegram Send Error: {e}")
+        logging.error(f"Telegram Send Error [{chat_id}]: {e}")
 
 async def send_telegram_photo(session, chat_id, photo_url, caption, reply_markup=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
@@ -343,12 +373,12 @@ async def send_telegram_photo(session, chat_id, photo_url, caption, reply_markup
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
     try:
-        async with session.post(url, json=payload, timeout=5) as resp:
+        async with session.post(url, json=payload, timeout=8) as resp:
             return await resp.json()
     except Exception as e:
-        logging.error(f"Telegram Photo Error: {e}")
+        logging.error(f"Telegram Photo Error [{chat_id}]: {e}")
 
-# ==================== VINTED API (TARGETED SEARCH) ====================
+# ==================== VINTED API (СТАБІЛЬНИЙ ПОШУК) ====================
 async def refresh_vinted_session(session, domain="at"):
     url = f"https://www.vinted.{domain}"
     user_agent = random.choice(USER_AGENTS)
@@ -359,7 +389,7 @@ async def refresh_vinted_session(session, domain="at"):
         "Connection": "keep-alive"
     }
     try:
-        async with session.get(url, headers=headers, timeout=8) as resp:
+        async with session.get(url, headers=headers, timeout=10) as resp:
             if resp.status == 200:
                 cookies = resp.cookies
                 text = await resp.text()
@@ -372,6 +402,7 @@ async def refresh_vinted_session(session, domain="at"):
                     "user_agent": user_agent,
                     "updated_at": time.time()
                 }
+                logging.info(f"Vinted session refreshed for [{domain}]")
                 return vinted_session_data[domain]
     except Exception as e:
         logging.error(f"Failed session refresh [{domain}]: {e}")
@@ -400,14 +431,16 @@ async def fetch_vinted_brand_items(session, domain="at", brand_query=None):
         headers["Authorization"] = f"Bearer {sess['token']}"
 
     try:
-        async with session.get(url, headers=headers, cookies=sess["cookies"], timeout=6) as resp:
+        async with session.get(url, headers=headers, cookies=sess["cookies"], timeout=8) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 return data.get("items", [])
-            elif resp.status in [401, 403]:
+            elif resp.status in [401, 403, 429]:
+                logging.warning(f"Vinted status {resp.status} on [{domain}]. Refreshing session & cooldown...")
                 vinted_session_data.pop(domain, None)
-    except Exception:
-        pass
+                await asyncio.sleep(5)  # Захист від бана
+    except Exception as e:
+        logging.error(f"Fetch Vinted items error [{domain}]: {e}")
     return []
 
 # ==================== МОМЕНТАЛЬНА ТА ЧАСОВО ФІЛЬТРОВАНА РОЗСИЛКА ====================
@@ -415,8 +448,12 @@ async def process_and_notify_items(session, items, domain):
     if not items:
         return
 
-    cursor = settings_collection.find({"active": True})
-    active_users = await cursor.to_list(length=1000)
+    try:
+        cursor = settings_collection.find({"active": True})
+        active_users = await cursor.to_list(length=1000)
+    except Exception as e:
+        logging.error(f"DB Error getting active users: {e}")
+        return
 
     if not active_users:
         return
@@ -431,11 +468,11 @@ async def process_and_notify_items(session, items, domain):
         # ----------------- ЧАСОВИЙ ФІЛЬТР (НЕ СТАРІШЕ 30 ХВИЛИН) -----------------
         created_at_ts = item.get("created_at_ts")
         if created_at_ts:
-            if created_at_ts > 1000000000000:  # якщо часовий штамп у мілісекундах
+            if created_at_ts > 1000000000000:  
                 created_at_ts /= 1000.0
 
             age = now_ts - created_at_ts
-            if age > MAX_ITEM_AGE_SECONDS:  # Пропускаємо речі, які старіші за 30 хвилин
+            if age > MAX_ITEM_AGE_SECONDS:  
                 await mark_item_seen(item_id)
                 continue
 
@@ -523,7 +560,7 @@ async def process_and_notify_items(session, items, domain):
                     f"💰 **Ціна:** {price_amount} {currency} (~{price_uah} UAH)\n"
                     f"✨ **Стан:** {'Новий' if is_new else 'Б/У'}\n"
                 )
-                await send_telegram_photo(session, user_id, photo_url, caption, get_item_keyboard(item_url))
+                asyncio.create_task(send_telegram_photo(session, user_id, photo_url, caption, get_item_keyboard(item_url)))
 
         await mark_item_seen(item_id)
 
@@ -554,6 +591,7 @@ async def vinted_monitor_loop(session):
                     items = await fetch_vinted_brand_items(session, domain=dom, brand_query=b_name)
                     if items:
                         await process_and_notify_items(session, items, dom)
+                    await asyncio.sleep(0.5)  # Мікропауза між брендами для збереження стійкості
 
         except Exception as e:
             logging.error(f"Error in monitor loop: {e}")
@@ -561,6 +599,12 @@ async def vinted_monitor_loop(session):
         await asyncio.sleep(CHECK_INTERVAL)
 
 # ==================== ОБРОБКА ПОВІДОМЛЕНЬ ====================
+async def safe_handle_update(session, update):
+    try:
+        await handle_update(session, update)
+    except Exception as e:
+        logging.error(f"Error handling update {update.get('update_id')}: {e}")
+
 async def handle_update(session, update):
     update_id = update.get("update_id")
     if update_id in processed_updates:
@@ -951,15 +995,15 @@ async def telegram_polling_loop(session):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
     while True:
         try:
-            params = {"offset": last_update_id + 1, "timeout": 5}
-            async with session.get(url, params=params, timeout=10) as resp:
+            params = {"offset": last_update_id + 1, "timeout": 10}
+            async with session.get(url, params=params, timeout=15) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     for update in data.get("result", []):
                         last_update_id = max(last_update_id, update["update_id"])
-                        asyncio.create_task(handle_update(session, update))
-        except Exception:
-            pass
+                        asyncio.create_task(safe_handle_update(session, update))
+        except Exception as e:
+            logging.error(f"Error in polling loop: {e}")
         await asyncio.sleep(0.5)
 
 # ==================== STARTUP ====================
