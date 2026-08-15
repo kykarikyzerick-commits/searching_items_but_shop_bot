@@ -19,8 +19,8 @@ ADMIN_ID = 8138110821
 
 MONGO_URI = "mongodb+srv://kykarikyzerick_db_user:CVz4czwK06sgQlSP@cluster0.xuoxdku.mongodb.net/?appName=Cluster0"
 
-# МАКСИМАЛЬНА ШВИДКІСТЬ (перевірка кожні 0.1 сек)
-CHECK_INTERVAL = 0.1  
+# МАКСИМАЛЬНА ШВИДКОСТЬ ПОШУКУ
+CHECK_INTERVAL = 0.05  
 ALLOWED_USERS = [8138110821]
 EUR_TO_UAH_RATE = 51.0
 
@@ -61,17 +61,15 @@ DOMAINS = {
 }
 
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 ]
 
 # ==================== ВАЛІДАЦІЯ ====================
 def is_valid_brand_name(name: str) -> bool:
     clean_name = name.strip()
-    if len(clean_name) < 2:
-        return False
-    if re.search(r'(.)\1{2,}', clean_name.lower()):
+    if len(clean_name) < 2 or re.search(r'(.)\1{2,}', clean_name.lower()):
         return False
     keyboard_patterns = ["qwerty", "asdfgh", "zxcvbn", "12345", "123456", "qwer", "asdf", "zxcv"]
     if any(pattern in clean_name.lower() for pattern in keyboard_patterns):
@@ -90,16 +88,17 @@ seen_items_collection = db["seen_items"]
 user_states = {}
 temp_brand_storage = {}
 active_users_cache = {}  
-seen_items_cache = set()  
-last_update_id = 0
+seen_items_cache = set()  # ШВИДКИЙ КЕШ В ОПЕРАТИВНІЙ ПАМ'ЯТІ
 vinted_session_data = {} 
 processed_updates = set()
 
 async def init_db_indexes():
     try:
         await seen_items_collection.create_index("item_id", unique=True)
-        async for doc in seen_items_collection.find().sort("_id", -1).limit(5000):
+        # Завантажуємо останні 20,000 збережених товарів в RAM при старті
+        async for doc in seen_items_collection.find().sort("_id", -1).limit(20000):
             seen_items_cache.add(str(doc.get("item_id")))
+        logging.info(f"Завантажено {len(seen_items_cache)} товарів у RAM кеш.")
     except Exception as e:
         logging.error(f"Error initializing DB indexes: {e}")
 
@@ -139,18 +138,11 @@ async def save_user_settings(user_id, settings):
     except Exception as e:
         logging.error(f"DB Error in save_user_settings: {e}")
 
+# ==================== СИСТЕМА БОРОТЬБИ З ДУБЛІКАТАМИ ====================
 def is_item_seen_fast(item_id):
     return str(item_id) in seen_items_cache
 
-async def mark_item_seen(item_id):
-    item_str = str(item_id)
-    seen_items_cache.add(item_str)
-    
-    if len(seen_items_cache) > 20000:
-        items_to_remove = list(seen_items_cache)[:5000]
-        for k in items_to_remove:
-            seen_items_cache.discard(k)
-
+async def save_item_to_db(item_str):
     try:
         await seen_items_collection.update_one(
             {"item_id": item_str},
@@ -159,6 +151,19 @@ async def mark_item_seen(item_id):
         )
     except Exception:
         pass
+
+def mark_item_seen_and_save(item_id):
+    item_str = str(item_id)
+    seen_items_cache.add(item_str)
+    
+    # Контроль розміру оперативної пам'яті
+    if len(seen_items_cache) > 50000:
+        items_to_remove = list(seen_items_cache)[:10000]
+        for k in items_to_remove:
+            seen_items_cache.discard(k)
+
+    # Фоновий запис в БД (без затримки для бота)
+    asyncio.create_task(save_item_to_db(item_str))
 
 async def get_key_data(key_code):
     try:
@@ -377,7 +382,7 @@ async def send_telegram_photo(session, chat_id, photo_url, caption, reply_markup
     except Exception as e:
         logging.error(f"Telegram Photo Error [{chat_id}]: {e}")
 
-# ==================== VINTED API (ШВИДКИЙ ПОШУК) ====================
+# ==================== VINTED API ====================
 async def refresh_vinted_session(session, domain="at"):
     url = f"https://www.vinted.{domain}"
     user_agent = random.choice(USER_AGENTS)
@@ -388,7 +393,7 @@ async def refresh_vinted_session(session, domain="at"):
         "Connection": "keep-alive"
     }
     try:
-        async with session.get(url, headers=headers, timeout=6) as resp:
+        async with session.get(url, headers=headers, timeout=5) as resp:
             if resp.status == 200:
                 cookies = resp.cookies
                 text = await resp.text()
@@ -415,9 +420,9 @@ async def fetch_vinted_brand_items(session, domain="at", brand_query=None):
         return []
 
     if brand_query:
-        url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={brand_query}&order=newest_first&per_page=10"
+        url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={brand_query}&order=newest_first&per_page=15"
     else:
-        url = f"https://www.vinted.{domain}/api/v2/catalog/items?order=newest_first&per_page=10"
+        url = f"https://www.vinted.{domain}/api/v2/catalog/items?order=newest_first&per_page=15"
 
     headers = {
         "User-Agent": sess["user_agent"],
@@ -429,7 +434,7 @@ async def fetch_vinted_brand_items(session, domain="at", brand_query=None):
         headers["Authorization"] = f"Bearer {sess['token']}"
 
     try:
-        async with session.get(url, headers=headers, cookies=sess["cookies"], timeout=5) as resp:
+        async with session.get(url, headers=headers, cookies=sess["cookies"], timeout=4) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 return data.get("items", [])
@@ -439,7 +444,7 @@ async def fetch_vinted_brand_items(session, domain="at", brand_query=None):
         pass
     return []
 
-# ==================== МОМЕНТАЛЬНА РОЗСИЛКА ====================
+# ==================== ШВИДКА ОБРОБКА БЕЗ ДУБЛІВ ====================
 async def process_and_notify_items(session, items, domain, active_users):
     if not items or not active_users:
         return
@@ -448,8 +453,13 @@ async def process_and_notify_items(session, items, domain, active_users):
 
     for item in items:
         item_id = item.get("id")
+        
+        # 1. МИТТЄВА ПЕРЕВІРКА І ЗАХИСТ ВІД ДУБЛІКАТІВ
         if not item_id or is_item_seen_fast(item_id):
             continue
+
+        # Враховуючи, що товар унікальний, ВІДРАЗУ позначаємо його переглянутим
+        mark_item_seen_and_save(item_id)
 
         created_at_ts = item.get("created_at_ts")
         if created_at_ts:
@@ -458,7 +468,6 @@ async def process_and_notify_items(session, items, domain, active_users):
 
             age = now_ts - created_at_ts
             if age > MAX_ITEM_AGE_SECONDS:  
-                await mark_item_seen(item_id)
                 continue
 
         title = item.get("title", "")
@@ -466,7 +475,6 @@ async def process_and_notify_items(session, items, domain, active_users):
         combined_text = f"{title} {description}".lower()
 
         if any(fake in combined_text for fake in FAKE_KEYWORDS):
-            await mark_item_seen(item_id)
             continue
 
         raw_price = item.get("price")
@@ -497,10 +505,7 @@ async def process_and_notify_items(session, items, domain, active_users):
         for user in active_users:
             user_id = int(user.get("user_id"))
 
-            if not active_users_cache.get(user_id, False):
-                continue
-
-            if not await is_user_active(user_id):
+            if not active_users_cache.get(user_id, False) or not await is_user_active(user_id):
                 continue
 
             user_domain = user.get("domain", "at")
@@ -545,10 +550,7 @@ async def process_and_notify_items(session, items, domain, active_users):
                     f"💰 **Ціна:** {price_amount} {currency} (~{price_uah} UAH)\n"
                     f"✨ **Стан:** {'Новий' if is_new else 'Б/У'}\n"
                 )
-                # МИТТЄВА АСИНХРОННА ВІДПРАВКА
                 asyncio.create_task(send_telegram_photo(session, user_id, photo_url, caption, get_item_keyboard(item_url)))
-
-        await mark_item_seen(item_id)
 
 async def fetch_and_notify(session, dom, b_name, active_users):
     items = await fetch_vinted_brand_items(session, domain=dom, brand_query=b_name)
@@ -579,7 +581,6 @@ async def vinted_monitor_loop(session):
                         tasks.append(fetch_and_notify(session, dom, None, active_users))
 
                 if tasks:
-                    # ПАРАЛЕЛЬНИЙ ЗАПУСК УСІХ ЗАПИТІВ ДЛЯ МАКСИМАЛЬНОЇ ШВИДКОСТІ
                     await asyncio.gather(*tasks, return_exceptions=True)
 
         except Exception as e:
@@ -771,7 +772,7 @@ async def handle_update(session, update):
             await send_telegram_message(session, chat_id, "Напишіть **назву бренду**:")
             return
 
-        if text == "💰 Змінити ціну існуючого бренду":
+        if text == "💰 Змінити ціну існуючного бренду":
             user_states[chat_id] = "select_brand_for_price_change"
             await send_telegram_message(session, chat_id, "Оберіть бренд для зміни ціни:", await get_user_brands_keyboard(chat_id))
             return
@@ -978,7 +979,7 @@ async def handle_update(session, update):
             await send_telegram_message(session, chat_id, f"🛒 Зверніться до адміна: tg://user?id={ADMIN_ID}")
             return
 
-# ==================== MAIN TELEGRAM LOOP ====================
+# ==================== MAIN LOOP ====================
 async def telegram_polling_loop(session):
     global last_update_id
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
@@ -993,9 +994,8 @@ async def telegram_polling_loop(session):
                         asyncio.create_task(safe_handle_update(session, update))
         except Exception as e:
             logging.error(f"Error in polling loop: {e}")
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.1)
 
-# ==================== STARTUP ====================
 async def main():
     await init_db_indexes()
     async with aiohttp.ClientSession() as session:
