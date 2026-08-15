@@ -19,8 +19,8 @@ ADMIN_ID = 8138110821
 
 MONGO_URI = "mongodb+srv://kykarikyzerick_db_user:CVz4czwK06sgQlSP@cluster0.xuoxdku.mongodb.net/?appName=Cluster0"
 
-# БЕЗПЕЧНИЙ ІНТЕРВАЛ (3 секунди між колами пошуку для запобігання бана IP)
-CHECK_INTERVAL = 3.0  
+# МАКСИМАЛЬНА ШВИДКІСТЬ (перевірка кожні 0.1 сек)
+CHECK_INTERVAL = 0.1  
 ALLOWED_USERS = [8138110821]
 EUR_TO_UAH_RATE = 51.0
 
@@ -146,9 +146,8 @@ async def mark_item_seen(item_id):
     item_str = str(item_id)
     seen_items_cache.add(item_str)
     
-    # Розумне очищення: видаляємо найстаріші 3000 елементів при перевищенні ліміту
-    if len(seen_items_cache) > 15000:
-        items_to_remove = list(seen_items_cache)[:3000]
+    if len(seen_items_cache) > 20000:
+        items_to_remove = list(seen_items_cache)[:5000]
         for k in items_to_remove:
             seen_items_cache.discard(k)
 
@@ -275,7 +274,7 @@ async def get_brand_management_keyboard(user_id):
     
     kb = [[{"text": "🆕 Створити новий бренд"}]]
     if brands:
-        kb.append([{"text": "💰 Змінити ціну існуючого бренду"}])
+        kb.append([{"text": "💰 Змінити ціну існуючного бренду"}])
         kb.append([{"text": "✏️ Змінити назву бренду (залишити ціну)"}])
     kb.append([{"text": "🔙 Головне меню"}])
     return {"keyboard": kb, "resize_keyboard": True, "persistent": True}
@@ -362,7 +361,7 @@ async def send_telegram_message(session, chat_id, text, reply_markup=None):
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
     try:
-        async with session.post(url, json=payload, timeout=8) as resp:
+        async with session.post(url, json=payload, timeout=5) as resp:
             return await resp.json()
     except Exception as e:
         logging.error(f"Telegram Send Error [{chat_id}]: {e}")
@@ -373,23 +372,23 @@ async def send_telegram_photo(session, chat_id, photo_url, caption, reply_markup
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
     try:
-        async with session.post(url, json=payload, timeout=8) as resp:
+        async with session.post(url, json=payload, timeout=5) as resp:
             return await resp.json()
     except Exception as e:
         logging.error(f"Telegram Photo Error [{chat_id}]: {e}")
 
-# ==================== VINTED API (СТАБІЛЬНИЙ ПОШУК) ====================
+# ==================== VINTED API (ШВИДКИЙ ПОШУК) ====================
 async def refresh_vinted_session(session, domain="at"):
     url = f"https://www.vinted.{domain}"
     user_agent = random.choice(USER_AGENTS)
     headers = {
         "User-Agent": user_agent,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
         "Connection": "keep-alive"
     }
     try:
-        async with session.get(url, headers=headers, timeout=10) as resp:
+        async with session.get(url, headers=headers, timeout=6) as resp:
             if resp.status == 200:
                 cookies = resp.cookies
                 text = await resp.text()
@@ -402,7 +401,6 @@ async def refresh_vinted_session(session, domain="at"):
                     "user_agent": user_agent,
                     "updated_at": time.time()
                 }
-                logging.info(f"Vinted session refreshed for [{domain}]")
                 return vinted_session_data[domain]
     except Exception as e:
         logging.error(f"Failed session refresh [{domain}]: {e}")
@@ -417,9 +415,9 @@ async def fetch_vinted_brand_items(session, domain="at", brand_query=None):
         return []
 
     if brand_query:
-        url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={brand_query}&order=newest_first&per_page=20"
+        url = f"https://www.vinted.{domain}/api/v2/catalog/items?search_text={brand_query}&order=newest_first&per_page=10"
     else:
-        url = f"https://www.vinted.{domain}/api/v2/catalog/items?order=newest_first&per_page=20"
+        url = f"https://www.vinted.{domain}/api/v2/catalog/items?order=newest_first&per_page=10"
 
     headers = {
         "User-Agent": sess["user_agent"],
@@ -431,31 +429,19 @@ async def fetch_vinted_brand_items(session, domain="at", brand_query=None):
         headers["Authorization"] = f"Bearer {sess['token']}"
 
     try:
-        async with session.get(url, headers=headers, cookies=sess["cookies"], timeout=8) as resp:
+        async with session.get(url, headers=headers, cookies=sess["cookies"], timeout=5) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 return data.get("items", [])
             elif resp.status in [401, 403, 429]:
-                logging.warning(f"Vinted status {resp.status} on [{domain}]. Refreshing session & cooldown...")
                 vinted_session_data.pop(domain, None)
-                await asyncio.sleep(5)  # Захист від бана
-    except Exception as e:
-        logging.error(f"Fetch Vinted items error [{domain}]: {e}")
+    except Exception:
+        pass
     return []
 
-# ==================== МОМЕНТАЛЬНА ТА ЧАСОВО ФІЛЬТРОВАНА РОЗСИЛКА ====================
-async def process_and_notify_items(session, items, domain):
-    if not items:
-        return
-
-    try:
-        cursor = settings_collection.find({"active": True})
-        active_users = await cursor.to_list(length=1000)
-    except Exception as e:
-        logging.error(f"DB Error getting active users: {e}")
-        return
-
-    if not active_users:
+# ==================== МОМЕНТАЛЬНА РОЗСИЛКА ====================
+async def process_and_notify_items(session, items, domain, active_users):
+    if not items or not active_users:
         return
 
     now_ts = time.time()
@@ -465,7 +451,6 @@ async def process_and_notify_items(session, items, domain):
         if not item_id or is_item_seen_fast(item_id):
             continue
 
-        # ----------------- ЧАСОВИЙ ФІЛЬТР (НЕ СТАРІШЕ 30 ХВИЛИН) -----------------
         created_at_ts = item.get("created_at_ts")
         if created_at_ts:
             if created_at_ts > 1000000000000:  
@@ -560,9 +545,15 @@ async def process_and_notify_items(session, items, domain):
                     f"💰 **Ціна:** {price_amount} {currency} (~{price_uah} UAH)\n"
                     f"✨ **Стан:** {'Новий' if is_new else 'Б/У'}\n"
                 )
+                # МИТТЄВА АСИНХРОННА ВІДПРАВКА
                 asyncio.create_task(send_telegram_photo(session, user_id, photo_url, caption, get_item_keyboard(item_url)))
 
         await mark_item_seen(item_id)
+
+async def fetch_and_notify(session, dom, b_name, active_users):
+    items = await fetch_vinted_brand_items(session, domain=dom, brand_query=b_name)
+    if items:
+        await process_and_notify_items(session, items, dom, active_users)
 
 async def vinted_monitor_loop(session):
     while True:
@@ -583,15 +574,13 @@ async def vinted_monitor_loop(session):
                     if user_brands:
                         for b in user_brands:
                             b_name = b.get("name") if isinstance(b, dict) else str(b)
-                            tasks.append((dom, b_name))
+                            tasks.append(fetch_and_notify(session, dom, b_name, active_users))
                     else:
-                        tasks.append((dom, None))
+                        tasks.append(fetch_and_notify(session, dom, None, active_users))
 
-                for dom, b_name in tasks:
-                    items = await fetch_vinted_brand_items(session, domain=dom, brand_query=b_name)
-                    if items:
-                        await process_and_notify_items(session, items, dom)
-                    await asyncio.sleep(0.5)  # Мікропауза між брендами для збереження стійкості
+                if tasks:
+                    # ПАРАЛЕЛЬНИЙ ЗАПУСК УСІХ ЗАПИТІВ ДЛЯ МАКСИМАЛЬНОЇ ШВИДКОСТІ
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
         except Exception as e:
             logging.error(f"Error in monitor loop: {e}")
@@ -996,7 +985,7 @@ async def telegram_polling_loop(session):
     while True:
         try:
             params = {"offset": last_update_id + 1, "timeout": 10}
-            async with session.get(url, params=params, timeout=15) as resp:
+            async with session.get(url, params=params, timeout=12) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     for update in data.get("result", []):
@@ -1004,7 +993,7 @@ async def telegram_polling_loop(session):
                         asyncio.create_task(safe_handle_update(session, update))
         except Exception as e:
             logging.error(f"Error in polling loop: {e}")
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.2)
 
 # ==================== STARTUP ====================
 async def main():
